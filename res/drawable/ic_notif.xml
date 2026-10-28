@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 通知栏小图标：纯白剪影（系统会做单色渲染） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- 表圈 -->
+    <path
+        android:pathData="M12,3.5 a8.5,8.5 0 1,0 0.01,0"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.8"
+        android:fillColor="#00000000"/>
+
+    <!-- 时针 / 分针 / 毫秒针 -->
+    <path
+        android:pathData="M12,12 L9,9.5 M12,12 L14.5,8.5 M12,12 L15,14.5"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+
+    <!-- 中心点 -->
+    <path
+        android:pathData="M12,12 m-1,0 a1,1 0 1,0 2,0 a1,1 0 1,0 -2,0"
+        android:fillColor="#FFFFFF"/>
+</vector>

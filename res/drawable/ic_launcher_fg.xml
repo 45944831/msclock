@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 前景：白色表盘 + 橙色毫秒针（108dp 自适应图标画布，安全区半径 ≤33dp） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 表圈 -->
+    <path
+        android:pathData="M24,54 a30,30 0 1,0 60,0 a30,30 0 1,0 -60,0"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+
+    <!-- 12/3/6/9 刻度 -->
+    <path
+        android:pathData="M54,30 L54,34 M78,54 L74,54 M54,78 L54,74 M30,54 L34,54"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+
+    <!-- 时针（指向 10 点） -->
+    <path
+        android:pathData="M54,54 L44,46"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+
+    <!-- 分针（指向 2 点） -->
+    <path
+        android:pathData="M54,54 L64,42"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+
+    <!-- 毫秒针（橙色，指向 4 点半）+ 针尖圆点：呼应悬浮窗橙色毫秒数字 -->
+    <path
+        android:pathData="M54,54 L68,66"
+        android:strokeColor="#FFB020"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+    <path
+        android:pathData="M68,66 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0"
+        android:fillColor="#FFB020"/>
+
+    <!-- 中心轴点 -->
+    <path
+        android:pathData="M54,54 m-3.5,0 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0"
+        android:fillColor="#FFFFFF"/>
+</vector>

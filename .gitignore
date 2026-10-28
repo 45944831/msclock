@@ -1,0 +1,40 @@
+# 构建产物
+build/
+build_out.txt
+*.idsig
+clock.apk
+
+# 签名密钥不随仓库分发（升级需沿用同一 keystore，请本地备份）
+debug.keystore
+
+# 测试中间产物（保留 res/、docs/、tests/ 与 AndroidManifest.xml）
+*.log
+*.pyc
+__pycache__/
+_*.py
+_*.png
+_*.md
+_u*.xml
+ui.xml
+ui_live.xml
+shot_*.png
+crop_float.png
+
+# 根目录开发脚本（仓库内以 tests/ 目录为准）
+/deep_test.py
+/test_*.py
+/run_all.py
+/pngcolor.py
+/analyze.py
+/count_color.py
+/crop.py
+/hsample.py
+/lines.py
+/sample.py
+/scan.py
+/ui_tap.py
+/vscan.py
+/install_helper.py
+_*.txt
+_*.json
+_*.xml
