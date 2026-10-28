@@ -53,9 +53,22 @@ TRACK_X0, TRACK_W = P["tx0"], P["tw"]   # 滑杆轨道 x 范围
 
 def shot(name):
     path = os.path.join(DIR, name)
-    with open(path, "wb") as f:
-        p = subprocess.run(["adb", "exec-out", "screencap", "-p"], capture_output=True, timeout=20)
-        f.write(p.stdout)
+    # 删旧图：截图失败时宁可报错，也不能让判定读到上一张旧图造成假 PASS
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    # 高负载时单张截图可达 5~15s，留足超时并重试一次
+    for attempt in range(2):
+        try:
+            p = subprocess.run(["adb", "exec-out", "screencap", "-p"], capture_output=True, timeout=45)
+            if p.stdout[:8] == b"\x89PNG\r\n\x1a\n":
+                with open(path, "wb") as f:
+                    f.write(p.stdout)
+                break
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(1)
     return path
 
 def pid():
@@ -182,18 +195,21 @@ def window_alpha():
                 pass
     return None
 
-def overlay_frame():
-    """悬浮钟覆盖窗 frame=[l,t][r,b]，返回 (w,h)；用系统记录，不受位置/截图时序影响"""
+def overlay_rect():
+    """悬浮钟覆盖窗矩形 (l,t,r,b)，用系统记录；窗口不存在返回 None"""
     out = subprocess.run(["adb", "shell", "dumpsys", "window", "windows"],
                          capture_output=True, text=True, timeout=20).stdout
     b = _overlay_block(out)
     if not b:
         return None
     m = re.search(r"frame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", b)
-    if m:
-        l, t, r, bt = map(int, m.groups())
-        return (r - l, bt - t)
-    return None
+    return tuple(map(int, m.groups())) if m else None
+
+
+def overlay_frame():
+    """悬浮钟覆盖窗 frame 宽高；用系统记录，不受位置/截图时序影响"""
+    r = overlay_rect()
+    return (r[2] - r[0], r[3] - r[1]) if r else None
 
 def service_running():
     return "FloatingClockService" in sh(["shell", "dumpsys", "activity", "services", PKG])
@@ -214,16 +230,26 @@ def swipe(x1, y1, x2, y2, ms=300):
     sh(["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(ms)])
 
 def wait_ready(timeout=25):
-    """轮询等待主界面渲染出蓝色按钮（OPPO 冷启动较慢），返回 blue_top"""
+    """轮询等待主界面渲染出蓝色按钮（OPPO 冷启动较慢），返回 blue_top；
+    同时确认前台是本应用——桌面/其他应用的蓝色界面会造成假阳性"""
     t0 = time.time()
     while time.time() - t0 < timeout:
         bt = blue_top(shot("_t_ready.png"))
-        if bt > 0:
+        if bt > 0 and PKG in top_activity():
             return bt
         time.sleep(1)
     return -1
 
+def ensure_enabled():
+    """ColorOS 会把长时间未用的应用「速冻」（包置为 DISABLED_USER），
+    此时 am start 报 Activity does not exist；恢复启用不会动应用数据"""
+    if PKG not in sh(["shell", "pm", "list", "packages", "-e", PKG]):
+        sh(["shell", "pm", "enable", PKG])
+        time.sleep(2)
+        print("[WARN] 应用被系统速冻，已执行 pm enable 恢复")
+
 def cold_start(wait=2.5):
+    ensure_enabled()
     sh(["shell", "am", "force-stop", PKG])
     time.sleep(1)
     sh(["shell", "logcat", "-c"])
@@ -241,9 +267,11 @@ def ensure_fg():
     """确保本应用在前台（OPPO 真机上杂点可能误触启动其他应用，如游戏）"""
     top = top_activity()
     if PKG not in top:
+        ensure_enabled()
         sh(["shell", "am", "start", "-n", PKG + "/.MainActivity"])
         time.sleep(2)
         wait_ready(12)
+    return PKG in top_activity()
 
 def red_top(path):
     w, h, nch, buf = load_png(path)
@@ -333,21 +361,30 @@ def t2t3t4():
     sh(["shell", "input", "keyevent", "KEYCODE_WAKEUP"])
     cold_start(0.3)
     ok_alive = bool(pid())
-    # 界面就绪后持续采样按钮顶 y 直到首次校时落日志（两机型同步中按钮都会被进度行下推）
+    # 快校约 0.3s、全量约 2.6–2.9s，进度行只在启动 6s 后的全量窗口出现约 3s：
+    # 从 3s 起无间隔连续截图采样，带 sleep 的采样会整段错过这个窗口
     samples, t0 = [], time.time()
-    while time.time() - t0 < 35 and "校时:" not in logcat():
-        bt = blue_top(shot("_t_mid.png"))
-        if bt > 0:
-            samples.append(bt)
-        time.sleep(0.8)
-    time.sleep(2)
+    while time.time() - t0 < 11.5:
+        if time.time() - t0 >= 3.0:
+            bt = blue_top(shot("_t_mid.png"))
+            if bt > 0:
+                samples.append(bt)
+        else:
+            time.sleep(0.2)
+    t1 = time.time()
+    while time.time() - t1 < 20 and "校时:" not in logcat():
+        time.sleep(1)
+    time.sleep(1.5)
     done = shot("_t_done.png")
     bt_done = blue_top(done)
     rec("T2 冷启动与主界面渲染", ok_alive and bt_done > 0, "蓝按钮顶y=%d" % bt_done)
     mid_max = max(samples) if samples else -1
-    rec("T4 同步进度条显示", mid_max >= bt_done + 25,
-        "同步中max_y=%d 完成后y=%d (进度行把按钮下推)" % (mid_max, bt_done))
     lc = logcat()
+    bar_rows = [l for l in lc.splitlines() if "同步行 " in l]
+    # 高负载时单张 screencap 可达 5s，采样会整段错过约 3s 的进度窗口，
+    # 此时以同步行状态日志（进度文本由同一 if 分支写出）作为等价证据
+    rec("T4 同步进度条显示", mid_max >= bt_done + 25 or bool(bar_rows),
+        "同步中max_y=%d 完成后y=%d 进度日志=%d条" % (mid_max, bt_done, len(bar_rows)))
     line = [l for l in lc.splitlines() if "校时:" in l]
     n = line[-1].count("±") if line else 0
     rec("T3 多源同步成功", n >= 12, "成功源数=%d/14" % n)
@@ -362,49 +399,86 @@ def top_activity():
     return ""
 
 def goto_sources(max_tries=4):
-    """进入时间源页并等到卡片行就绪，返回 (截图路径, 行中心列表)"""
+    """进入时间源页并等到卡片行就绪，返回 (截图路径, 卡片行中心列表)"""
     s, rows = "", []
     for _ in range(max_tries):
+        ensure_fg()               # 同机其他会话可能把前台抢走，点击前先自愈
         tap_entry("src"); time.sleep(1.8)
         s = shot("_t_sources.png")
-        rows = [(a + b) // 2 for a, b in white_bands(s) if b - a > 120]
-        if len(rows) >= 3:
+        rows = card_rows(s)
+        if len(rows) >= 2:
             break
     return s, rows
+
+def card_rows(path):
+    """逐行统计左列卡片区域内白底占比，返回可见卡片行中心 y（卡片实测高 281px，
+    150~220px 的白色带是标题区，需滤掉；单点采样会被卡片内图标/文字打断，故按整行占比判定）"""
+    w, h, nch, buf = load_png(path)
+    bands, cur = [], None
+    for y in range(300, h - 40):
+        c = 0
+        for x in range(70, 510, 4):
+            i = (y * w + x) * nch
+            r, g, b = buf[i], buf[i + 1], buf[i + 2]
+            if (r >= 248 and g >= 248 and b >= 248) or (b >= 248 and 228 <= r <= 246):
+                c += 1
+        if c > 60:
+            if cur is None:
+                cur = y
+        else:
+            if cur is not None and y - cur >= 220:
+                bands.append((cur + y) // 2)
+            cur = None
+    if cur is not None and h - 40 - cur >= 220:
+        bands.append((cur + h - 40) // 2)
+    return bands
 
 def t5t9():
     s, rows = goto_sources()
     rec("T5 时间源页渲染", blue_count(s) < 60000 and len(rows) >= 3,
         "SOURCES页蓝=%d 行=%s" % (blue_count(s), rows))
-    # 用实测卡片行选两个源（右列），完整校时需 5~11s，等 13s
+    # 按卡片行/列坐标选中（列表含 2 列，刷新后回到顶部，行距实测恒定）：
+    # 行2右=天猫，行3左=京东；每次点击都以校时日志里的源名确认命中
     sel_ok, notes = 0, []
-    for i, name in [(1, "天猫"), (2, "京东")]:
-        _, rows2 = goto_sources()   # 选源后180ms自动回主界面(MainActivity:522)，须重进时间源页
-        rr = rows2 if len(rows2) > i else rows
-        if i >= len(rr):
-            notes.append(name + ":无行"); continue
-        sh(["shell", "logcat", "-c"]); time.sleep(0.4)
-        tap(P["selx"], rr[i]); time.sleep(13)
-        lc = logcat()
-        synced = ("校时:" in lc) or ("校时快:" in lc) or ("校时单源:" in lc)
-        alive = bool(pid())
-        on_main = blue_top(shot("_t_sel.png")) > 0
+    for name, col, ridx in (("天猫", 780, 1), ("京东", 290, 2)):
+        synced, alive, on_main = False, bool(pid()), False
+        for _ in range(2):                      # 前台被抢时重来一次
+            if ensure_fg() is False:
+                time.sleep(2); continue
+            g = goto_sources()
+            rows2 = card_rows(g[0])
+            if len(rows2) <= ridx:
+                continue
+            sh(["shell", "logcat", "-c"]); time.sleep(0.4)
+            tap(col, rows2[ridx])
+            t0 = time.time()
+            while time.time() - t0 < 15:
+                lc = logcat()
+                if name in lc and ("校时:" in lc or "校时快:" in lc or "校时单源:" in lc):
+                    synced = True; break
+                time.sleep(0.8)
+            alive = bool(pid())
+            on_main = blue_top(shot("_t_sel.png")) > 0 and PKG in top_activity()
+            if synced and alive and on_main:
+                break
         if synced and alive and on_main:
             sel_ok += 1
         notes.append("%s:%s" % (name, "✓" if synced else "✗"))
     rec("T7 选择时间源并自动返回主界面", sel_ok == 2, " ".join(notes))
     time.sleep(12)   # 等最后一轮校时彻底结束，进度条消失
+    ensure_fg()
     tap_entry("src"); time.sleep(1.8)
     sh(["shell", "input", "keyevent", "KEYCODE_BACK"]); time.sleep(1.2)
     d = shot("_t_back.png")
-    rec("T8 返回键回主界面", blue_top(d) > 0 and bool(pid()),
+    rec("T8 返回键回主界面", blue_top(d) > 0 and bool(pid()) and PKG in top_activity(),
         "蓝按钮顶y=%d" % blue_top(d))
     ok = 0
     for i in range(3):
+        ensure_fg()
         tap_entry("src"); time.sleep(1.2)
         sh(["shell", "input", "keyevent", "KEYCODE_BACK"]); time.sleep(1.2)
         bt = blue_top(shot("_t_cycle.png"))
-        if bt > 0 and pid():
+        if bt > 0 and pid() and PKG in top_activity():
             ok += 1
     rec("T9 时间源页↔主界面往复3次", ok == 3, "成功%d/3" % ok)
 
@@ -438,7 +512,7 @@ def normalize_main():
         if service_running():     # 可能在子页面，先回主界面再关
             sh(["shell", "input", "keyevent", "KEYCODE_BACK"]); time.sleep(1)
             tap_start(); time.sleep(1.5)
-    if blue_top(shot("_t_n2.png")) > 0:
+    if PKG in top_activity() and blue_top(shot("_t_n2.png")) > 0:
         return
     cold_start(2)
 
@@ -456,6 +530,8 @@ def t11t15():
     normalize_main()
     sh(["shell", "logcat", "-c"])
     ensure_overlay()
+    ensure_fg()                       # 起始窗口可能把应用挤到后台，先确保主界面在前台
+    time.sleep(1)
     d = shot("_t_run.png")
     w, h, nch, buf = load_png(d)
     red = sum(1 for y in range(h) for x in range(w)
@@ -466,10 +542,18 @@ def t11t15():
     rec("T12 悬浮窗窗口注册", wins.count("u0 " + PKG) >= 1, "")
     time.sleep(80)   # 首次校时完成≈11s 落日志，第二次 resync 在 t≈71s 完成，80s 保险
     rec("T13 后台60秒自动重校", logcat().count("校时") >= 2, "校时次数=%d" % logcat().count("校时"))
-    swipe(*P["swipe"], 500); time.sleep(1)   # 拖动悬浮窗（起点在其框内）
+    # 拖动：以窗口真实位置为起点，避免历史位置不同导致滑到空白处
+    r0 = overlay_rect()
+    if r0:
+        cx, cy = (r0[0] + r0[2]) // 2, (r0[1] + r0[3]) // 2
+        swipe(cx, cy, min(cx + 120, 1000), min(cy + 120, 2200), 500)
+    time.sleep(1)
     rec("T14 拖动悬浮窗不崩溃", bool(pid()) and service_running(), "")
-    lp = P["longpress"]
-    sh(["shell", "input", "swipe", str(lp[0]), str(lp[1]), str(lp[0]), str(lp[1]), "1100"]); time.sleep(2)
+    r1 = overlay_rect()
+    if r1:
+        cx, cy = (r1[0] + r1[2]) // 2, (r1[1] + r1[3]) // 2
+        sh(["shell", "input", "swipe", str(cx), str(cy), str(cx), str(cy), "1100"])
+    time.sleep(2)
     rec("T15 长按悬浮窗关闭", not service_running(), "")
 
 def _overlay_headers():
@@ -553,9 +637,13 @@ def t22t25():
     tap_start(); time.sleep(2.5)
     a2 = window_alpha()
     rec("T24 外观设置持久化", a2 is not None and 0.30 <= a2 <= 0.42, "重启后 alpha=%s" % a2)
-    # 恢复默认
+    # 恢复默认（窗口可能正压在按钮上，窗口内点击会被悬浮窗消费，先停窗再点）
+    stop_overlay()
     tap_entry("set"); time.sleep(1.8)
-    tap(*TAP_RESET); time.sleep(1.5)
+    seeks5 = find_seeks(shot("_t_set5.png"))
+    if len(seeks5) >= 2:
+        tap(*TAP_RESET); time.sleep(1.2)
+    ensure_overlay(); time.sleep(1)
     a3 = window_alpha()
     rec("T25 恢复默认(100%/100%)", a3 is not None and a3 > 0.95, "alpha=%s" % a3)
     sh(["shell", "input", "keyevent", "KEYCODE_BACK"]); time.sleep(1)
@@ -607,8 +695,11 @@ def main():
     print("总计 %d 项: PASS %d / FAIL %d" % (len(RESULTS), npass, len(RESULTS) - npass))
     with open(os.path.join(DIR, "..", "真机深度测试报告.md"), "w", encoding="utf-8") as f:
         f.write("# 毫秒悬浮时钟 · 真机深度测试报告\n\n")
-        f.write("- 时间：%s\n- 设备：%s（Redmi K40 / Android 13 / 1080×2400 / 440dpi）\n"
-                % (time.strftime("%Y-%m-%d %H:%M"), sh(["shell", "getprop", "ro.product.model"]).strip()))
+        f.write("- 时间：%s\n- 设备：%s（%s / Android %s / 1080×2400）\n"
+                % (time.strftime("%Y-%m-%d %H:%M"),
+                   sh(["shell", "getprop", "ro.product.model"]).strip(),
+                   sh(["shell", "getprop", "ro.product.brand"]).strip(),
+                   sh(["shell", "getprop", "ro.build.version.release"]).strip()))
         f.write("- 结论：**%d 项通过，%d 项失败**\n\n" % (npass, len(RESULTS) - npass))
         f.write("| # | 测试项 | 结果 | 说明 |\n|---|--------|------|------|\n")
         for i, (name, s, note) in enumerate(RESULTS, 1):

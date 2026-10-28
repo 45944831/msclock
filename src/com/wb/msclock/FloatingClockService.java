@@ -84,7 +84,7 @@ public class FloatingClockService extends Service {
     private static volatile long failureBackoffUntil = 0;
     private static volatile int failStreak = 0;
     private static volatile boolean pendingFull = false;
-    private static volatile boolean syncingFull = false;
+    public static volatile boolean syncingFull = false;
     private static volatile int syncGen = 0;
     private static Future<?> syncFuture;
     private static final ExecutorService syncExec = Executors.newSingleThreadExecutor(r -> {
@@ -330,6 +330,7 @@ public class FloatingClockService extends Service {
         TimeSync.progTotal = full ? TimeSync.KEYS.length - 1 : TimeSync.FAST_SOURCES;
         TimeSync.progDone.set(0);
         final int gen = ++syncGen;
+        final long tSubmit = SystemClock.elapsedRealtime();
         syncFuture = syncExec.submit(() -> {
             TimeSync.Result r;
             try {
@@ -337,6 +338,8 @@ public class FloatingClockService extends Service {
             } catch (Throwable t) {
                 r = null;
             }
+            android.util.Log.d("MSClock", "startSync" + (full ? "全量" : "快") + " 完成 "
+                    + (SystemClock.elapsedRealtime() - tSubmit) + "ms");
             if (gen != syncGen) return;       // 已被取消/替代
             if (r != null) {
                 lastResult = r;
@@ -526,7 +529,8 @@ public class FloatingClockService extends Service {
         registerScreenReceiver();
         ui.postDelayed(() -> startSync(false), 150);
         ui.postDelayed(() -> {
-            if (lastFullSyncAt == 0) startSync(true);
+            if (lastFullSyncAt == 0
+                    || System.currentTimeMillis() - lastFullSyncAt > 60_000) startSync(true);
         }, 6000);
         if (!screenOff) {
             ui.postDelayed(resync, 60_000);

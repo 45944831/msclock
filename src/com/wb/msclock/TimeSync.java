@@ -50,7 +50,7 @@ public class TimeSync {
     public static final java.util.concurrent.atomic.AtomicInteger progDone =
             new java.util.concurrent.atomic.AtomicInteger();
     public static volatile int progTotal = 0;
-    /** 最近一次校时的失败明细，如 "抖音(连接超时) 云闪付(网络错误)"；全部成功时为空串 */
+    /** 最近一次校时的失败明细，如 "哔哩哔哩(连接超时) 云闪付(网络错误)"；全部成功时为空串 */
     public static volatile String lastFailText = "";
 
     public static class Result {
@@ -70,7 +70,8 @@ public class TimeSync {
     /** 校时探测共用线程池：有界并发，核心线程空闲回收，避免每次同步新建 14 个线程 */
     private static final ThreadPoolExecutor POOL;
     static {
-        POOL = new ThreadPoolExecutor(4, 4, 30, TimeUnit.SECONDS,
+        // 8 线程：14 个源两批跑完；4 线程时单个慢源会把整轮拖到超时
+        POOL = new ThreadPoolExecutor(8, 8, 30, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(),
                 r -> {
                     Thread t = new Thread(r, "timesync");
@@ -85,17 +86,17 @@ public class TimeSync {
     //（device 占 0 位，KINDS[0]="none"、URLS[0]=null，不联网）
     public static final String[] KEYS = {
             "device", "taobao", "tmall", "jd", "meituan", "eleme",
-            "vip", "pdd", "douyin", "kuaishou", "xhs", "alipay", "rail", "unionpay",
+            "vip", "pdd", "bili", "kuaishou", "xhs", "alipay", "rail", "unionpay",
             "ntp"
     };
     public static final String[] NAMES = {
             "设备时间", "淘宝", "天猫", "京东", "美团", "饿了么",
-            "唯品会", "拼多多", "抖音", "快手", "小红书", "支付宝", "12306", "云闪付",
+            "唯品会", "拼多多", "哔哩哔哩", "快手", "小红书", "支付宝", "12306", "云闪付",
             "阿里云NTP"
     };
     public static final String[] COLORS = {
             "#8A93A6", "#FF6A00", "#FF0036", "#E8443A", "#FFC300", "#1E90FF",
-            "#F10180", "#E02E24", "#161823", "#FF8800", "#FF2442", "#1677FF", "#1A5CC8", "#005BAC",
+            "#F10180", "#E02E24", "#00A1D6", "#FF8800", "#FF2442", "#1677FF", "#1A5CC8", "#005BAC",
             "#3DDC84"
     };
     private static final String[] KINDS = {
@@ -112,7 +113,7 @@ public class TimeSync {
             "https://www.ele.me/",
             "https://www.vip.com/",
             "https://mobile.yangkeduo.com/",
-            "https://www.douyin.com/",
+            "https://www.bilibili.com/",
             "https://www.kuaishou.com/",
             "https://www.xiaohongshu.com/",
             "https://my.alipay.com/",
@@ -124,7 +125,7 @@ public class TimeSync {
     public static final String[] DOMAINS = {
             "设备系统时钟", "h5api.m.taobao.com", "h5api.m.tmall.com",
             "api.m.jd.com", "www.meituan.com", "www.ele.me",
-            "www.vip.com", "mobile.yangkeduo.com", "www.douyin.com",
+            "www.vip.com", "mobile.yangkeduo.com", "www.bilibili.com",
             "www.kuaishou.com", "www.xiaohongshu.com",             "my.alipay.com", "www.12306.cn", "www.unionpayintl.com", "ntp.aliyun.com"
     };
 
@@ -200,6 +201,7 @@ public class TimeSync {
     }
 
     private static Result calibrate(boolean full) {
+        long tStart = System.currentTimeMillis();
         Result r = new Result();
         r.full = full;
         final int[] idx;
@@ -219,7 +221,10 @@ public class TimeSync {
             final int i = idx[k];
             final int slot = k;
             futures.add(POOL.submit(() -> {
+                long t0 = System.currentTimeMillis();
                 Probe p = probeOne(i, !full);
+                android.util.Log.d("MSClock", "源耗时 " + p.name + " " + (System.currentTimeMillis() - t0) + "ms "
+                        + (p.ok ? "ok" : (p.err == null ? "fail" : p.err)));
                 if (sid == scanSeq.get()) {
                     slots[slot] = p;
                     progDone.incrementAndGet();
@@ -227,7 +232,7 @@ public class TimeSync {
                 return p;
             }));
         }
-        long deadline = System.currentTimeMillis() + (full ? 12000 : 3500);
+        long deadline = System.currentTimeMillis() + (full ? 6000 : 2200);
         for (int k = 0; k < futures.size(); k++) {
             Future<Probe> f = futures.get(k);
             try {
@@ -243,6 +248,8 @@ public class TimeSync {
             r.list.add(slots[k]);
         }
         finalizeResult(r, full);
+        android.util.Log.d("MSClock", "校时总耗时 " + (System.currentTimeMillis() - tStart) + "ms ("
+                + (full ? "全量" : "快") + ")");
         return r;
     }
 
@@ -250,6 +257,7 @@ public class TimeSync {
     public static Probe calibrateSingle(String key) {
         final int i = indexOf(key);
         if (i < 0) return null;
+        long t0 = System.currentTimeMillis();
         Future<Probe> f = POOL.submit(() -> probeOne(i, false));
         Probe p;
         try {
@@ -259,6 +267,7 @@ public class TimeSync {
             p = failed(i, "响应超时");
         }
         logSingle(p);
+        android.util.Log.d("MSClock", "单源总耗时 " + (System.currentTimeMillis() - t0) + "ms");
         return p;
     }
 
@@ -323,12 +332,10 @@ public class TimeSync {
         Probe ntp = null;
         for (Probe p : r.list) if (p.ok && "阿里云NTP".equals(p.name)) ntp = p;
         int total = r.total > 0 ? r.total : (full ? KEYS.length - 1 : FAST_SOURCES);
-        if (ntp != null) {
-            r.text = String.format("已同步 %d/%d 源 · 本机%s %.0fms",
-                    okCount, total, ntp.offset >= 0 ? "慢" : "快", Math.abs(ntp.offset));
-        } else {
-            r.text = String.format("已同步 %d/%d 源", okCount, total);
-        }
+        // NTP 失败时用综合值兜底，避免快校只显示"已同步 2/3 源"却没有偏差
+        double ref = ntp != null ? ntp.offset : r.offset;
+        r.text = String.format("已同步 %d/%d 源 · 本机%s %.0fms",
+                okCount, total, ref >= 0 ? "慢" : "快", Math.abs(ref));
     }
 
     private static Probe failed(int i, String err) {
@@ -357,7 +364,8 @@ public class TimeSync {
                     m = probeMs(URLS[i], fast ? 2 : 4);
                     break;
                 case "ntp":
-                    m = probeNtp(URLS[i], fast ? 2 : 4, fast ? 1200 : 2500);
+                    // 快校只给 UDP 一次机会：UDP 123 常被运营商拦截，多次重试会把整轮拖到秒级
+                    m = probeNtp(URLS[i], fast ? 1 : 3, fast ? 900 : 1500);
                     break;
                 default:
                     m = probeDate(URLS[i], 15, why);
@@ -430,27 +438,41 @@ public class TimeSync {
         double minRtt = Double.MAX_VALUE;
         int n = 0;
         double step = 1000.0 / samples;
+        long started = System.currentTimeMillis();
+        // 整体预算：保证至少 8 个样本铺满 1 秒相位，慢站点也不拖住整轮
+        final long budget = 3200;
+        boolean noDateOnHead = false;
         for (int i = 0; i < samples; i++) {
+            long elapsed = System.currentTimeMillis() - started;
+            if ((n >= 8 && elapsed > budget) || elapsed > 5000) break;
             HttpURLConnection c = null;
             try {
                 long t0 = System.currentTimeMillis();
-                c = open(url, UA_PC);
-                try {
-                    c.setRequestMethod("HEAD");      // 只要响应头，省流量
-                } catch (Throwable ignored) {
+                c = open(url, UA_PC, 1500, 1800);
+                long dateMs = -1;
+                long t1;
+                if (!noDateOnHead) {
+                    try {
+                        c.setRequestMethod("HEAD");      // 只要响应头，省流量
+                    } catch (Throwable ignored) {
+                    }
+                    c.getResponseCode();                 // 等到响应头到达
+                    dateMs = c.getHeaderFieldDate("Date", -1);
+                    t1 = System.currentTimeMillis();
+                    if (dateMs <= 0) noDateOnHead = true;
+                } else {
+                    t1 = t0;
                 }
-                c.getResponseCode();                 // 等到响应头到达
-                long dateMs = c.getHeaderFieldDate("Date", -1);
-                if (dateMs <= 0) {
-                    // 少数站点对 HEAD 不回 Date，本次采样退回 GET
+                if (noDateOnHead) {
+                    // 部分站点（如哔哩哔哩）对 HEAD 不回 Date，后续采样直接 GET：
+                    // 拿到响应头即计时断开，不下载正文（整页正文可达数百 KB，会把 RTT 和区间宽度撑大）
                     try { c.disconnect(); } catch (Throwable ignored) { }
                     t0 = System.currentTimeMillis();
-                    c = open(url, UA_PC);
+                    c = open(url, UA_PC, 1500, 1800);
                     c.getResponseCode();
                     dateMs = c.getHeaderFieldDate("Date", -1);
-                    readAll(c);
+                    t1 = System.currentTimeMillis();
                 }
-                long t1 = System.currentTimeMillis();
                 c.disconnect();
                 c = null;
                 if (dateMs <= 0) continue;
@@ -575,9 +597,14 @@ public class TimeSync {
 
     // ------------------------------------------------------------ 工具
     private static HttpURLConnection open(String url, String ua) throws Exception {
+        return open(url, ua, 3000, 3000);
+    }
+
+    private static HttpURLConnection open(String url, String ua, int connectMs, int readMs)
+            throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(5000);
-        c.setReadTimeout(5000);
+        c.setConnectTimeout(connectMs);
+        c.setReadTimeout(readMs);
         c.setRequestProperty("User-Agent", ua);
         c.setRequestProperty("Accept", "*/*");
         c.setRequestProperty("Connection", "keep-alive");

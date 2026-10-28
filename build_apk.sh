@@ -25,8 +25,8 @@ echo "==> 2/6 链接资源与清单"
     --java "$OUT/gen" \
     --min-sdk-version 26 \
     --target-sdk-version 33 \
-    --version-code 1 \
-    --version-name 1.0 \
+    --version-code 2 \
+    --version-name 1.1 \
     "$OUT/res.zip"
 
 echo "==> 3/6 编译 Java"

@@ -53,14 +53,47 @@ def main_toggle(bt):
     D.tap(540, bt + 150)
 
 
+def ensure_app():
+    """同机并行跑其他测试时，本应用可能被切到后台/杀掉：回到前台再继续，避免后续步骤全错位"""
+    if PKG in D.top_activity():
+        return True
+    for _ in range(2):
+        sh(["shell", "am", "start", "-n", PKG + "/.MainActivity"]); time.sleep(2.5)
+        if PKG in D.top_activity():
+            return True
+    return False
+
+
 def goto_sources(bt):
-    D.tap(540, bt + 845)
-    time.sleep(1.8)
+    for _ in range(3):
+        if PKG not in D.top_activity():
+            ensure_app()
+            nbt = D.wait_ready(20)
+            if nbt > 0:
+                bt = nbt
+            else:
+                continue
+        D.tap(540, bt + 845)
+        time.sleep(1.8)
+        if PKG in D.top_activity():
+            return
+        print("  [WARN] 时间源入口点击后应用不在前台，重试", flush=True)
 
 
 def goto_settings(bt):
-    D.tap(540, bt + 1060)
-    time.sleep(1.8)
+    for _ in range(3):
+        if PKG not in D.top_activity():
+            ensure_app()
+            nbt = D.wait_ready(20)
+            if nbt > 0:
+                bt = nbt
+            else:
+                continue
+        D.tap(540, bt + 1060)
+        time.sleep(1.8)
+        if PKG in D.top_activity():
+            return
+        print("  [WARN] 设置入口点击后应用不在前台，重试", flush=True)
 
 
 def back():
@@ -125,7 +158,7 @@ def normalize():
 
 def t_build():
     v = sh(["shell", "dumpsys", "package", PKG])
-    rec("F01 安装与版本", "versionName=1.0" in v and "targetSdk=33" in v)
+    rec("F01 安装与版本", "versionName=1.1" in v and "targetSdk=33" in v)
 
 
 def t_start():

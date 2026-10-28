@@ -39,7 +39,7 @@ public class MainActivity extends Activity {
 
     private static final String[] ALL_KEYS = {
             "auto", "device", "taobao", "tmall", "jd", "meituan", "eleme",
-            "vip", "pdd", "douyin", "kuaishou", "xhs", "alipay", "rail", "unionpay",
+            "vip", "pdd", "bili", "kuaishou", "xhs", "alipay", "rail", "unionpay",
             "ntp"
     };
 
@@ -98,8 +98,10 @@ public class MainActivity extends Activity {
         refreshOverlayGranted();
         FloatingClockService.requestSync();
         // 快校时先出结果，稍后再补一次全量，保证时间源页 14 源都有数据
+        // 服务在跑时由服务自己的定时器负责全量，这里不要再排一轮（否则启动会连跑两次全量）
         handler.postDelayed(() -> {
             if (isFinishing() || isDestroyed()) return;
+            if (FloatingClockService.isAlive()) return;
             long now = System.currentTimeMillis();
             if (FloatingClockService.lastFullSyncAt == 0
                     || now - FloatingClockService.lastFullSyncAt > 60_000) {
@@ -728,7 +730,11 @@ public class MainActivity extends Activity {
             int total = TimeSync.progTotal, done = TimeSync.progDone.get();
             syncBar.setVisibility(View.VISIBLE);
             syncBar.setProgress(total > 0 ? done * 100 / total : 0);
-            st = "同步中 " + done + "/" + total + "…";
+            // 已有可用结果时的全量刷新属于后台补数据，不该让用户觉得"还在同步"
+            boolean bgRefresh = FloatingClockService.syncingFull && r != null && r.ok;
+            st = bgRefresh
+                    ? "已同步 · 后台刷新 " + done + "/" + total + "…"
+                    : "同步中 " + done + "/" + total + "…";
             stColor = SUB;
             tvFail.setVisibility(View.GONE);
         } else {
@@ -750,6 +756,7 @@ public class MainActivity extends Activity {
         if (!st.equals(lastSyncText)) {
             lastSyncText = st;
             tvMainSync.setText(st);
+            android.util.Log.d("MSClock", "同步行 " + st);
         }
         tvMainSync.setTextColor(stColor);
 
