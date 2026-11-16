@@ -81,6 +81,50 @@ public class TimeMathTest {
         // 负时间（1970 前）floorMod 仍应落在合法范围
         check("负时间不越界", TimeMath.formatClock(-1, false, 0).matches("\\d{2}:\\d{2}:\\d{2}"));
 
+        System.out.println("[TimeMath] 校时结果融合（抗抖动）");
+        // 无历史 → 直接采纳
+        near("融合:首次直接采纳", TimeMath.fuseOffset(0, 0, -58.0, 25.0), -58.0, 1e-9);
+        // 小差异噪声、两源 unc 相同 → 等权 0.5，融合值取中点
+        double f1 = TimeMath.fuseOffset(-60.0, 25.0, -52.0, 25.0);
+        check("融合:小差异取中间", f1 > -60.0 && f1 < -52.0);
+        near("融合:等unc取中点", f1, -56.0, 1e-6);
+        // 新值置信度低（unc 大）→ 权重被抬到下限 0.5，仍会跟随但不被旧值锁死
+        double fLow = TimeMath.fuseOffset(-60.0, 20.0, -50.0, 200.0);
+        near("融合:低置信权重下限0.5", fLow, -60.0 + 0.5 * 10.0, 1e-6);
+        // 超 3σ 真实跳变 → 直接采纳新值
+        // σ = sqrt(25²+25²) ≈ 35.36，3σ ≈ 106；跳 500ms 必须直采
+        near("融合:大跳变直采", TimeMath.fuseOffset(-60.0, 25.0, 440.0, 25.0), 440.0, 1e-9);
+        // 新值极高置信（unc=5）→ 权重被限到 0.9
+        double f2 = TimeMath.fuseOffset(-60.0, 100.0, -50.0, 5.0);
+        near("融合:高置信权重上限0.9", f2, -60.0 + 0.9 * 10.0, 1e-6);
+        // 旧 unc 极大（低置信）→ 新值仍受 0.9 上限约束，不会完全丢弃历史
+        check("融合:权重不超过0.9", Math.abs(f2 - (-50.0)) > 1e-6);
+
+        System.out.println("[TimeMath] 频率偏差拟合（drift）");
+        check("drift:样本不足返回null",
+                TimeMath.fitDrift(new double[]{0, 60}, new double[]{0, 1.5}, new double[]{5, 5}, 2) == null);
+        // 完美线性 25ppm：每秒偏移增加 0.025ms
+        double[] t3 = {0, 60, 120};
+        double[] o3 = {0, 1.5, 3.0};
+        double[] u3 = {5, 5, 5};
+        double[] d3 = TimeMath.fitDrift(t3, o3, u3, 3);
+        check("drift:三样本有解", d3 != null);
+        near("drift:25ppm 拟合准确", d3[0], 25.0, 0.5);
+        near("drift:无噪声残差近零", d3[1], 0.0, 1e-6);
+        // 零漂移
+        double[] d0 = TimeMath.fitDrift(new double[]{0, 60, 120},
+                new double[]{-60, -60, -60}, new double[]{5, 5, 5}, 3);
+        near("drift:零漂移", d0[0], 0.0, 1e-6);
+        // 含 ±3ms 噪声，斜率仍应接近真值
+        double[] dN = TimeMath.fitDrift(new double[]{0, 60, 120, 180},
+                new double[]{0, 4.5, 3.0, 7.5}, new double[]{5, 5, 5, 5}, 4);
+        check("drift:含噪声仍有解", dN != null && Math.abs(dN[0] - 25.0) < 12.0);
+        check("drift:残差为正", dN[1] > 0);
+        // 加权：unc 大的离群点影响应更小
+        double[] dW = TimeMath.fitDrift(new double[]{0, 60, 120},
+                new double[]{0, 50.0, 3.0}, new double[]{5, 500, 5}, 3);
+        check("drift:离群点被降权", Math.abs(dW[0] - 25.0) < 3.0);
+
         System.out.println();
         System.out.println("RESULT: " + passed + " passed, " + failed + " failed");
         if (failed > 0) System.exit(1);

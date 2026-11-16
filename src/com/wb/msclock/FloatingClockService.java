@@ -13,6 +13,7 @@ import android.content.SharedPreferences;
 import android.graphics.PixelFormat;
 import android.net.ConnectivityManager;
 import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -46,7 +47,7 @@ public class FloatingClockService extends Service {
     private static final String PREFS = "settings";
 
     public static boolean running = false;
-    public static String lastStatus = "";
+    public static volatile String lastStatus = "";
 
     /** 当前选中的时间源：auto / taobao / tmall / jd / meituan / eleme / ntp / device */
     public static volatile String source = "auto";
@@ -147,6 +148,8 @@ public class FloatingClockService extends Service {
                 }
             }
             appliedOffsetMs = (cachedValid ? cachedOffsetMs : 0) + manualMs;
+            // 缓存值来自上次进程，精度不可考：给较大的 unc，让首次实测以较高权重接管
+            appliedUnc = cachedValid ? 80 : 0;
             usingCachedOffset = cachedValid;
         } catch (Throwable ignored) {
         }
@@ -263,6 +266,7 @@ public class FloatingClockService extends Service {
             cachedValid = true;
             // 服务未运行时也让主界面立刻反映新源的偏移
             appliedOffsetMs = off + manualMs;
+            appliedUnc = 0;          // 换源后历史基准已失效，下次实测直接采纳
             usingCachedOffset = false;
             if (inst != null) inst.applyResult(lastResult, true);
         } else {
@@ -270,6 +274,7 @@ public class FloatingClockService extends Service {
             cachedOffsetMs = 0;
             cachedValid = false;
             appliedOffsetMs = manualMs;
+            appliedUnc = 0;
             usingCachedOffset = false;
             if (inst != null) inst.applyRestoredOffset();
         }
@@ -300,6 +305,7 @@ public class FloatingClockService extends Service {
                 ? resolveOffset(lastResult, source)
                 : (cachedValid ? cachedOffsetMs : 0);
         appliedOffsetMs = base + manualMs;
+        appliedUnc = 0;              // 用户手动微调后不再融合，以下一次实测为准
         if (inst != null) {
             if (lastResult != null && lastResult.ok) inst.applyResult(lastResult, true);
             else inst.applyRestoredOffset();
@@ -362,6 +368,22 @@ public class FloatingClockService extends Service {
             if (syncFuture != null) syncFuture.cancel(true);
         }
         if (!full && nowElapsed < failureBackoffUntil) return;
+        // Doze 空闲态：网络被系统挂起，快校必然全失败，还会污染 failStreak 触发退避。
+        // 全量保留（用户主动打开时间源页时值得试一次）。
+        if (!full && isDeviceIdle(instance)) {
+            android.util.Log.d("MSClock", "Doze 空闲态，跳过快校");
+            return;
+        }
+        // 无网预检：不发任何请求，0ms 给出可操作结论（v1.3 会跑满全部源空转 6 秒）
+        if (!isOnline(instance)) {
+            android.util.Log.d("MSClock", "无活动网络，跳过校时");
+            TimeSync.Result off = TimeSync.offlineResult(full);
+            lastResult = off;
+            lastStatus = off.text;
+            lastSyncAt = System.currentTimeMillis();
+            syncVersion++;              // 让界面立刻显示"未连接网络"
+            return;
+        }
         syncing = true;
         syncingFull = full;
         syncStartElapsed = nowElapsed;
@@ -428,6 +450,18 @@ public class FloatingClockService extends Service {
 
     private double baseServerMs;
     private long baseElapsed;
+    /** 当前基准的不确定度（ms）；≤0 表示无历史，融合时直接采纳新值。静态以匹配 appliedOffsetMs */
+    private static volatile double appliedUnc;
+    /** 频率偏差（ppm）：由历史校时结果拟合，用于两次校时之间的走时补偿 */
+    private volatile double driftPpm;
+
+    /** drift 拟合样本环形缓冲（最多 8 条） */
+    private static final int DRIFT_CAP = 8;
+    private final double[] driftT = new double[DRIFT_CAP];
+    private final double[] driftOff = new double[DRIFT_CAP];
+    private final double[] driftUnc = new double[DRIFT_CAP];
+    private int driftN;
+    private int driftHead;
     private int dragDownX, dragDownY;
     private int startX, startY;
     private long downAt;
@@ -460,7 +494,7 @@ public class FloatingClockService extends Service {
     private void scheduleSecondTick() {
         ui.removeCallbacks(secondTick);
         if (!running || view == null || choreographer == null || screenOff || showMillis) return;
-        long wall = (long) baseServerMs + (SystemClock.elapsedRealtime() - baseElapsed);
+        long wall = currentWallMs();
         long delay = 1000L - Math.floorMod(wall, 1000L);
         if (delay < 30L) delay = 1000L + delay;   // 边界附近留给下一秒，避免同秒重复画
         ui.postDelayed(secondTick, delay);
@@ -555,7 +589,7 @@ public class FloatingClockService extends Service {
                 + " userClosed=" + userClosed);
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
         view = new ClockView(this);
-        view.setSource(() -> baseServerMs + (SystemClock.elapsedRealtime() - baseElapsed));
+        view.setSource(this::currentWallMs);
 
         int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -620,7 +654,9 @@ public class FloatingClockService extends Service {
 
         registerNetworkCallback();
         registerScreenReceiver();
-        ui.postDelayed(() -> startSync(false), 150);
+        // 500ms 而不是 150ms：ConnectivityManager 的网络状态在开关切换后有短暂滞后，
+        // 太早预检会把"刚断网"误判为有网，白跑一轮注定失败的请求
+        ui.postDelayed(() -> startSync(false), 500);
         ui.postDelayed(() -> {
             // 用单调钟判断，避免系统时间被校时/手动修改后 60s 门槛永不满足
             if (lastFullSyncElapsed == 0
@@ -629,6 +665,46 @@ public class FloatingClockService extends Service {
         if (!screenOff) {
             ui.postDelayed(resync, 60_000);
             ui.postDelayed(fullResync, 600_000);
+        }
+    }
+
+    /**
+     * 是否真的有可用网络。必须同时满足 INTERNET 与 VALIDATED：
+     * 只连上但需认证的 WiFi（酒店/机场门户）有 INTERNET 却没有 VALIDATED，
+     * 此时校时同样会全部失败，提前判定比跑满 14 个源更好。
+     * 任何异常都按"有网"放行，把判定交给实际请求，避免误伤。
+     */
+    private static boolean isOnline(Context ctx) {
+        if (ctx == null) return true;      // 服务未运行时不阻断，交给实际请求判定
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return true;
+            Network n = cm.getActiveNetwork();
+            if (n == null) {
+                android.util.Log.d("MSClock", "网络预检: 无活动网络");
+                return false;
+            }
+            NetworkCapabilities caps = cm.getNetworkCapabilities(n);
+            boolean inet = caps != null
+                    && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+            boolean valid = caps != null
+                    && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+            android.util.Log.d("MSClock", "网络预检: inet=" + inet + " valid=" + valid);
+            return inet && valid;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** 是否处于 Doze 空闲态（网络被系统挂起，校时无意义） */
+    private static boolean isDeviceIdle(Context ctx) {
+        if (ctx == null) return false;
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            return pm != null && pm.isDeviceIdleMode();
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -695,6 +771,18 @@ public class FloatingClockService extends Service {
                     failureBackoffUntil = 0;
                     if (screenOff) return;   // 熄屏不唤醒校时，亮屏时统一补校
                     startSync(false);
+                }
+
+                @Override
+                public void onLost(Network network) {
+                    // 断网瞬间就告诉用户，而不是等下一轮校时跑完才显示"同步失败"
+                    try {
+                        if (isOnline(FloatingClockService.this)) return;   // 还有别的网络（如 WiFi 切数据），不必改状态
+                        lastStatus = "未连接网络";
+                        syncVersion++;
+                        android.util.Log.d("MSClock", "网络已断开");
+                    } catch (Throwable ignored) {
+                    }
                 }
             };
             cm.registerDefaultNetworkCallback(netCallback);
@@ -908,11 +996,98 @@ public class FloatingClockService extends Service {
         return cached != null ? cached : TimeSync.offsetOf(r, key);
     }
 
+    /**
+     * 当前墙钟毫秒。走时 = 锚点 + 单调钟增量 × (1 + 频偏)。
+     * 频偏项让"熄屏数小时/弱网长时间无法校时"后的累积误差降低一个量级。
+     */
+    private long currentWallMs() {
+        long dt = SystemClock.elapsedRealtime() - baseElapsed;
+        return (long) (baseServerMs + dt * (1.0 + driftPpm * 1e-6));
+    }
+
+    /** 本次测量结果的不确定度：综合值取参与源的中位 unc 折半，单源取其自身 unc */
+    private double resolveUnc(TimeSync.Result r, String key) {
+        if ("device".equals(key)) return 0;
+        if ("auto".equals(key)) {
+            double[] us = new double[r.list.size()];
+            int n = 0;
+            for (TimeSync.Probe p : r.list) if (p.ok) us[n++] = p.unc;
+            if (n == 0) return 60;
+            // 多源合成后不确定度按 1/√n 收缩，这里取中位数的 0.6 倍作为保守估计
+            return Math.max(5.0, TimeMath.median(us, n) * 0.6);
+        }
+        TimeSync.Probe p = TimeSync.probeOf(r, key);
+        return (p != null && p.ok) ? Math.max(p.unc, 5.0) : 60;
+    }
+
+    /** 记录一次测量样本用于频偏拟合；不可信样本（unc 过大）不入库 */
+    private void recordDriftSample(double offset, double unc) {
+        if (unc <= 0 || unc > 500) return;
+        double t = SystemClock.elapsedRealtime() / 1000.0;
+        driftT[driftHead] = t;
+        driftOff[driftHead] = offset;
+        driftUnc[driftHead] = unc;
+        driftHead = (driftHead + 1) % DRIFT_CAP;
+        if (driftN < DRIFT_CAP) driftN++;
+    }
+
+    /**
+     * 重新拟合频偏。保护条件缺一不可，否则 drift 归零：
+     * 样本 ≥3、时间跨度 ≥120s、|ppm| ≤100、残差 RMS ≤15ms。
+     * 这些门槛的意义是——宁可不补偿，也不能用一个被噪声拟合出来的假斜率把走时带偏。
+     */
+    private void updateDrift() {
+        if (driftN < 3) return;
+        double[] ts = new double[driftN];
+        double[] os = new double[driftN];
+        double[] us = new double[driftN];
+        int start = (driftHead - driftN + DRIFT_CAP) % DRIFT_CAP;
+        for (int i = 0; i < driftN; i++) {
+            int idx = (start + i) % DRIFT_CAP;
+            ts[i] = driftT[idx];
+            os[i] = driftOff[idx];
+            us[i] = driftUnc[idx];
+        }
+        if (ts[driftN - 1] - ts[0] < 120) return;
+        double[] fit = TimeMath.fitDrift(ts, os, us, driftN);
+        if (fit == null) return;
+        if (Math.abs(fit[0]) > 100 || fit[1] > 15) {
+            driftPpm = 0;      // 噪声主导或测量跳变，放弃补偿
+            android.util.Log.d("MSClock", String.format(
+                    "drift 弃用: %.1fppm 残差%.1fms (样本%d)", fit[0], fit[1], driftN));
+            return;
+        }
+        double old = driftPpm;
+        driftPpm = old * 0.7 + fit[0] * 0.3;   // 平滑更新，避免抖动
+        android.util.Log.d("MSClock", String.format(
+                "drift 更新: %.1fppm 残差%.1fms (样本%d)", driftPpm, fit[1], driftN));
+        // 频偏改变会让走时斜率突变：dt 越大跳得越狠（10 分钟 × 5ppm ≈ 3ms）。
+        // 变化超过 2ppm 时用旧斜率算出当前时刻并重锚，保证显示连续。
+        if (Math.abs(driftPpm - old) > 2.0) {
+            final double od = old;
+            ui.post(() -> {
+                long now = (long) (baseServerMs
+                        + (SystemClock.elapsedRealtime() - baseElapsed) * (1.0 + od * 1e-6));
+                baseServerMs = now;
+                baseElapsed = SystemClock.elapsedRealtime();
+            });
+        }
+    }
+
     /** 把校时结果落到悬浮窗的走时锚点上 */
     private void applyResult(final TimeSync.Result r, final boolean force) {
         if (r == null || !r.ok) return;
         final double off = resolveOffset(r, source);
-        final double total = off + manualMs;
+        final double unc = resolveUnc(r, source);
+        // 置信度加权融合：抑制测量噪声导致的毫秒位跳变（RFC 5905 clock discipline 简化版）
+        final double total = TimeMath.fuseOffset(appliedOffsetMs, appliedUnc, off + manualMs, unc);
+        if (Math.abs(total - (off + manualMs)) > 0.5) {
+            android.util.Log.d("MSClock", String.format(
+                    "融合: 实测%.1f → 基准%.1f (unc %.0f/%.0f)", off + manualMs, total, unc, appliedUnc));
+        }
+        // 频偏拟合用融合前的原始测量值，避免融合把真实斜率抹平
+        recordDriftSample(off, unc);
+        updateDrift();
         final int accent = TimeSync.colorOf("auto".equals(source) ? "ntp" : source);
         boolean exact = "auto".equals(source) || "device".equals(source);
         if (!exact) {
@@ -925,13 +1100,15 @@ public class FloatingClockService extends Service {
             cachedValid = true;
         }
         ui.post(() -> {
-            // 缓存 → 实测、切换源、调微调时强制重锚；常规刷新仅在偏移变化超过 20ms 时重锚，避免可见跳动
-            if (!force && !usingCachedOffset && Math.abs(total - appliedOffsetMs) < 20) {
+            // 缓存 → 实测、切换源、调微调时强制重锚。
+            // 常规刷新：融合后差异已很小，超过 3ms 才重锚，兼顾"不跳"与"跟得上"
+            if (!force && !usingCachedOffset && Math.abs(total - appliedOffsetMs) < 3) {
                 return;
             }
             baseServerMs = System.currentTimeMillis() + total;
             baseElapsed = SystemClock.elapsedRealtime();
             appliedOffsetMs = total;
+            appliedUnc = unc;
             usingCachedOffset = false;
             if (view != null) {
                 view.setAccent(accent);

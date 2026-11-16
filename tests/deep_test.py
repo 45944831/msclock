@@ -416,7 +416,7 @@ def t2t3t4():
         "同步中max_y=%d 完成后y=%d 进度日志=%d条" % (mid_max, bt_done, len(bar_rows)))
     line = [l for l in lc.splitlines() if "校时:" in l]
     n = line[-1].count("±") if line else 0
-    rec("T3 多源同步成功", n >= 12, "成功源数=%d/14" % n)
+    rec("T3 多源同步成功", n >= 12, "成功源数=%d/16" % n)
     rec("T3b 正常路径无失败弹窗", not dim_ok(done), "")
 
 def top_activity():

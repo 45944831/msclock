@@ -191,7 +191,7 @@ def t_start():
         "同步中max=%s 完成=%d 进度日志=%d条" % (max(samples) if samples else -1, bt2, len(bar_rows)))
     lc = D.logcat(); last = [l for l in lc.splitlines() if "校时:" in l]
     n = last[-1].count("±") if last else 0
-    rec("F04 多源校时成功", n >= 12, "成功源=%d/14" % n)
+    rec("F04 多源校时成功", n >= 12, "成功源=%d/16" % n)
     rec("F05 正常路径无失败弹窗", not dim(shot("_q2_done.png")))
     return bt2
 

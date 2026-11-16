@@ -1,5 +1,6 @@
 package com.wb.msclock;
 
+import android.os.Build;
 import android.os.SystemClock;
 
 import java.io.ByteArrayOutputStream;
@@ -53,6 +54,8 @@ public class TimeSync {
         public double rtt;
         public boolean ok;
         public String err;      // 失败原因（ok=false 时有值）
+        /** 可选源：失败时不计入总数、不参与失败判定（GNSS 室内无信号属正常） */
+        public boolean optional;
     }
 
     /** 同步进度（供界面显示）：已完成源数 / 总源数 */
@@ -62,13 +65,22 @@ public class TimeSync {
     /** 最近一次校时的失败明细，如 "哔哩哔哩(连接超时) 云闪付(网络错误)"；全部成功时为空串 */
     public static volatile String lastFailText = "";
 
+    /** 失败类型：供 UI 给出可操作的提示，而不是一句笼统的"请检查网络" */
+    public static final int FAIL_NONE = 0;
+    public static final int FAIL_NO_NETWORK = 1;   // 无活动网络 / 未通过 VALIDATED
+    public static final int FAIL_TIMEOUT = 2;      // 有网但全部超时
+    public static final int FAIL_DNS = 3;          // 多数域名解析失败
+    public static final int FAIL_SSL = 4;          // 多数 SSL 握手失败
+    public static final int FAIL_OTHER = 5;
+
     public static class Result {
         public List<Probe> list = new ArrayList<>();
         public double offset;   // 综合 offset，ms
         public boolean ok;
-        public boolean full;    // true=全量 14 源，false=快校时 3 源
+        public boolean full;    // true=全量，false=快校时 3 源
         public int total = 3;   // 本轮参与统计的源数（单源合并后会增长）
         public int okCount;
+        public int failKind = FAIL_NONE;
         public String text = "未校时";
     }
 
@@ -96,22 +108,22 @@ public class TimeSync {
     public static final String[] KEYS = {
             "device", "taobao", "tmall", "jd", "meituan", "eleme",
             "vip", "pdd", "bili", "kuaishou", "xhs", "alipay", "rail", "unionpay",
-            "ntp"
+            "ntp", "gnss", "sysnet"
     };
     public static final String[] NAMES = {
             "设备时间", "淘宝", "天猫", "京东", "美团", "饿了么",
             "唯品会", "拼多多", "哔哩哔哩", "快手", "小红书", "支付宝", "12306", "云闪付",
-            "阿里云NTP"
+            "阿里云NTP", "GNSS授时", "系统网络时间"
     };
     public static final String[] COLORS = {
             "#8A93A6", "#FF6A00", "#FF0036", "#E8443A", "#FFC300", "#1E90FF",
             "#F10180", "#E02E24", "#00A1D6", "#FF8800", "#FF2442", "#1677FF", "#1A5CC8", "#005BAC",
-            "#3DDC84"
+            "#3DDC84", "#1E8E3E", "#7C4DFF"
     };
     private static final String[] KINDS = {
             "none", "ms", "ms", "date", "date", "date",
             "date", "date", "date", "date", "date", "date", "date", "date",
-            "ntp"
+            "ntp", "gnss", "sysnet"
     };
     private static final String[] URLS = {
             null,
@@ -128,15 +140,24 @@ public class TimeSync {
             "https://my.alipay.com/",
             "https://www.12306.cn/index/",
             "https://www.unionpayintl.com/",
-            "ntp.aliyun.com"
+            "ntp.aliyun.com",
+            null,   // gnss：走 SystemClock.currentGnssTimeClock()，无 URL
+            null    // sysnet：走 SystemClock.currentNetworkTimeClock()，无 URL
     };
     /** 各源展示用的域名 */
     public static final String[] DOMAINS = {
             "设备系统时钟", "h5api.m.taobao.com", "h5api.m.tmall.com",
             "api.m.jd.com", "www.meituan.com", "www.ele.me",
             "www.vip.com", "mobile.yangkeduo.com", "www.bilibili.com",
-            "www.kuaishou.com", "www.xiaohongshu.com",             "my.alipay.com", "www.12306.cn", "www.unionpayintl.com", "ntp.aliyun.com"
+            "www.kuaishou.com", "www.xiaohongshu.com", "my.alipay.com", "www.12306.cn", "www.unionpayintl.com",
+            "ntp.aliyun.com", "系统 GNSS 时钟", "系统网络时间"
     };
+
+    /** 可选源：失败不计入总数、不触发失败判定（室内无 GNSS 信号属正常） */
+    private static boolean isOptionalKind(int i) {
+        String k = KINDS[i];
+        return "gnss".equals(k) || "sysnet".equals(k);
+    }
 
     /** 源下标；-1 表示未知 key */
     public static int indexOf(String key) {
@@ -199,7 +220,23 @@ public class TimeSync {
     /** 快校时使用的源数 */
     public static final int FAST_SOURCES = 3;
 
-    /** 全量校时：14 个网络源 */
+    /**
+     * 无网络时直接构造失败结果：不发任何请求、不占用线程池、0ms 返回。
+     * 调用方（Service）已用 ConnectivityManager 做过 VALIDATED 预检。
+     */
+    public static Result offlineResult(boolean full) {
+        Result r = new Result();
+        r.full = full;
+        r.ok = false;
+        r.failKind = FAIL_NO_NETWORK;
+        r.text = "未连接网络";
+        r.total = full ? KEYS.length - 1 : FAST_SOURCES;
+        // 不写 lastFailText：否则主界面会显示"未通过: 未连接网络"，与状态行重复且措辞别扭
+        lastFailText = "";
+        return r;
+    }
+
+    /** 全量校时：全部网络源 + 可选系统源 */
     public static Result calibrate() {
         return calibrate(true);
     }
@@ -221,7 +258,9 @@ public class TimeSync {
             idx = new int[KEYS.length - 1];
             for (int i = 1; i < KEYS.length; i++) idx[i - 1] = i;
         } else {
-            idx = new int[]{indexOf("taobao"), indexOf("tmall"), indexOf("ntp")};
+            // 快校不再固定用淘宝/天猫/NTP：按历史健康度动态选，避免某个接口变更后
+            // 快校持续失败而其他 12 个源其实是好的
+            idx = pickFastSources(FAST_SOURCES);
         }
         progTotal = idx.length;
         progDone.set(0);
@@ -262,6 +301,101 @@ public class TimeSync {
         android.util.Log.d("MSClock", "校时总耗时 " + (SystemClock.elapsedRealtime() - tStart) + "ms ("
                 + (full ? "全量" : "快") + ")");
         return r;
+    }
+
+    // ------------------------------------------------------------ 源健康度
+    /**
+     * 每个源的健康画像：指数移动平均的成功率与不确定度，外加失败退避。
+     * 进程内记忆即可——重启后退回默认先验，最坏情况等价于 v1.3 的固定选源。
+     */
+    private static final class Health {
+        double successRate = 0.5;   // EMA，0..1
+        double uncEma = 60.0;       // EMA of unc (ms)
+        int failStreak;
+        long backoffUntil;          // elapsedRealtime；0 = 无退避
+    }
+
+    private static final Map<String, Health> HEALTH =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 默认快校源给一点先验，保证首次运行仍按淘宝/天猫/NTP 走 */
+    private static Health healthOf(String name) {
+        return HEALTH.computeIfAbsent(name, k -> {
+            Health h = new Health();
+            if ("淘宝".equals(k) || "天猫".equals(k) || "阿里云NTP".equals(k)) {
+                h.successRate = 0.7;
+            }
+            return h;
+        });
+    }
+
+    /** 记录一次探测结果，更新成功率/精度画像与退避状态 */
+    private static void recordHealth(Probe p) {
+        if (p == null || p.name == null) return;
+        Health h = healthOf(p.name);
+        synchronized (h) {
+            h.successRate = h.successRate * 0.8 + (p.ok ? 1.0 : 0.0) * 0.2;
+            if (p.ok) {
+                h.uncEma = h.uncEma * 0.8 + p.unc * 0.2;
+                h.failStreak = 0;
+                h.backoffUntil = 0;
+            } else if (!p.optional) {
+                h.failStreak++;
+                if (h.failStreak >= 3) {
+                    // 30s → 60s → 120s → 240s → 480s，上限 10min
+                    long ms = Math.min(600_000L, 30_000L << Math.min(h.failStreak - 3, 4));
+                    h.backoffUntil = SystemClock.elapsedRealtime() + ms;
+                }
+            }
+        }
+    }
+
+    /** 健康度评分：成功率越高、历史精度越好，分数越高 */
+    private static double healthScore(int i) {
+        Health h = healthOf(NAMES[i]);
+        synchronized (h) {
+            return h.successRate * (100.0 / (h.uncEma + 20.0));
+        }
+    }
+
+    /**
+     * 快校选源：排除可选源（GNSS/系统时间）与退避中的源，按健康度取前 n。
+     * 候选不足时用默认三源补齐，保证任何情况下都有 n 个源。
+     */
+    private static int[] pickFastSources(int n) {
+        long now = SystemClock.elapsedRealtime();
+        List<Integer> cand = new ArrayList<>();
+        for (int i = 1; i < KEYS.length; i++) {
+            if ("none".equals(KINDS[i])) continue;
+            if (isOptionalKind(i)) continue;              // 可选源不进快校
+            Health h = HEALTH.get(NAMES[i]);
+            if (h != null && h.backoffUntil > now) continue;   // 退避中，跳过
+            cand.add(i);
+        }
+        // 分数四舍五入到两位再比，避免浮点误差打乱同分时的稳定顺序
+        cand.sort((a, b) -> {
+            int c = Double.compare(
+                    Math.round(healthScore(b) * 100), Math.round(healthScore(a) * 100));
+            return c != 0 ? c : Integer.compare(a, b);
+        });
+        int[] out = new int[n];
+        int cnt = 0;
+        for (int i = 0; i < cand.size() && cnt < n; i++) out[cnt++] = cand.get(i);
+        // 补齐：退避导致候选不足时，仍用默认三源（宁可试一次也不要空转）
+        String[] fallback = {"taobao", "tmall", "ntp"};
+        for (int f = 0; f < fallback.length && cnt < n; f++) {
+            int i = indexOf(fallback[f]);
+            if (i < 0) continue;
+            boolean dup = false;
+            for (int k = 0; k < cnt; k++) if (out[k] == i) { dup = true; break; }
+            if (!dup) out[cnt++] = i;
+        }
+        if (cnt < n) {
+            int[] shrink = new int[cnt];
+            System.arraycopy(out, 0, shrink, 0, cnt);
+            return shrink;
+        }
+        return out;
     }
 
     /** 单源探测：选中某个时间源时使用，避免整轮全量扫描 */
@@ -317,13 +451,24 @@ public class TimeSync {
             java.util.Arrays.sort(sorted);
             double median = sorted[okCnt / 2];
             for (Probe p : r.list) {
-                if (p.ok && Math.abs(p.offset - median) > 2000) {
+                if (!p.ok) continue;
+                double dev = Math.abs(p.offset - median);
+                if (p.optional && dev > 200) {
+                    // 系统级时间源可能与真实时间脱节（Android 每约 18h 才同步一次网络时间，
+                    // 实测见过 -434ms），偏差过大时直接剔除，绝不能让它污染合成结果。
+                    p.ok = false;
+                    p.err = "与综合值偏差过大";
+                    android.util.Log.d("MSClock", "可选源剔除(偏差" + (long) dev + "ms): " + p.name);
+                    continue;
+                }
+                if (dev > 2000) {
                     p.unc = Math.max(p.unc * 8.0, 1000.0);
                     android.util.Log.d("MSClock", "离群源降权(中位数基准): " + p.name);
                 }
             }
         }
-        int okCount = 0;
+        int okCount = 0, optFail = 0;
+        int nTimeout = 0, nDns = 0, nSsl = 0;
         StringBuilder dbg = new StringBuilder();
         StringBuilder fail = new StringBuilder();
         for (Probe p : r.list) {
@@ -331,17 +476,46 @@ public class TimeSync {
                 okCount++;
                 dbg.append(p.name).append(String.format(" %+.0f±%.0fms; ", p.offset, p.unc));
             } else {
-                dbg.append(p.name).append("(").append(p.err == null ? "失败" : p.err).append("); ");
-                fail.append(p.name).append("(").append(p.err == null ? "失败" : p.err).append(") ");
+                String e = p.err == null ? "失败" : p.err;
+                dbg.append(p.name).append("(").append(e).append("); ");
+                if (p.optional) {
+                    // GNSS 室内无信号、系统时间未同步都属正常：不计入总数，也不进失败明细，
+                    // 否则用户会看到"未通过: GNSS授时"这种无从处理的提示
+                    optFail++;
+                } else {
+                    fail.append(p.name).append("(").append(e).append(") ");
+                    if (e.contains("超时")) {
+                        nTimeout++;
+                    } else if (e.contains("解析")) {
+                        nDns++;
+                    } else if (e.contains("SSL")) {
+                        nSsl++;
+                    }
+                }
             }
         }
+        if (optFail > 0) r.total = Math.max(1, r.total - optFail);
         r.okCount = okCount;
         r.ok = okCount > 0;
         // 全量总是刷新明细；快校成功时也刷新，避免上一轮全量失败的红字在恢复后残留
         if (full || r.ok) lastFailText = fail.toString().trim();
         android.util.Log.d("MSClock", "校时" + (full ? "" : "快") + ": " + dbg);
         if (!r.ok) {
-            r.text = "同步失败，请检查网络";
+            // 分级文案：让用户知道该开网络、查 DNS 还是等接口恢复，而不是一句笼统的"请检查网络"
+            int judged = Math.max(1, r.total);
+            if (nDns * 2 > judged) {
+                r.failKind = FAIL_DNS;
+                r.text = "域名解析失败 · 检查 DNS/VPN";
+            } else if (nSsl * 2 > judged) {
+                r.failKind = FAIL_SSL;
+                r.text = "SSL 握手失败 · 检查代理/证书";
+            } else if (nTimeout * 2 > judged) {
+                r.failKind = FAIL_TIMEOUT;
+                r.text = "全部源超时 · 网络可能被限制";
+            } else {
+                r.failKind = FAIL_OTHER;
+                r.text = "同步失败，请检查网络";
+            }
             return;
         }
         r.offset = combine(r.list);
@@ -363,11 +537,19 @@ public class TimeSync {
         return p;
     }
 
+    /** 探测并顺带更新健康度画像（calibrate / calibrateSingle 两条路径都覆盖） */
     private static Probe probeOne(int i, boolean fast) {
+        Probe p = probeOneRaw(i, fast);
+        recordHealth(p);
+        return p;
+    }
+
+    private static Probe probeOneRaw(int i, boolean fast) {
         Probe p = new Probe();
         p.name = NAMES[i];
         p.color = COLORS[i];
         p.ok = false;
+        p.optional = isOptionalKind(i);
         if ("none".equals(KINDS[i])) {
             p.err = "本地时钟";
             return p;
@@ -383,6 +565,11 @@ public class TimeSync {
                     // 快校给 UDP 两次机会（阿里云失败换腾讯接力）：UDP 123 常被运营商拦截，
                     // 只试一次会让快校在拦截网络下彻底失去 NTP 基准
                     m = probeNtp(URLS[i], fast ? 2 : 3, fast ? 900 : 1500);
+                    break;
+                case "gnss":
+                case "sysnet":
+                    // 系统级可信时间：不发网络请求，取不到就静默跳过
+                    m = probeSystemClock(KINDS[i]);
                     break;
                 default:
                     m = probeDate(URLS[i], 15, why);
@@ -745,6 +932,41 @@ public class TimeSync {
      * 换算精确抵消（锚定端同样基于跳钟后的墙钟，两处误差相互抵消）。
      * 前后各取一次墙钟，取数间隙恰被跳钟击中时以后一次为准。
      */
+    /**
+     * 系统级可信时间源。Android 维护着两条独立于本应用的时间通道：
+     * <ul>
+     *   <li>{@code currentGnssTimeClock()}（API 29+）GNSS 卫星授时，室外可达微秒级，<b>无需网络</b></li>
+     *   <li>{@code currentNetworkTimeClock()}（API 33+）系统 NTP/NITZ 结果</li>
+     * </ul>
+     * 两者在无信号/未同步时会抛异常（GNSS 在室内基本必然抛），这里一律返回 null
+     * 由调用方按"可选源跳过"处理，绝不能算作失败——否则室内会永久显示 15/17 源。
+     */
+    private static double[] probeSystemClock(String kind) {
+        boolean gnss = "gnss".equals(kind);
+        if (gnss) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null;          // API 29
+        } else {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null;   // API 33
+        }
+        long e0 = SystemClock.elapsedRealtime();
+        long t;
+        try {
+            java.time.Clock c = gnss
+                    ? SystemClock.currentGnssTimeClock()
+                    : SystemClock.currentNetworkTimeClock();
+            t = c.millis();
+        } catch (Throwable th) {
+            return null;   // 无 GNSS 信号 / 系统时间尚未同步
+        }
+        long e1 = SystemClock.elapsedRealtime();
+        if (t <= 0) return null;
+        double off = t - (e0 + e1) / 2.0 - wallGap();
+        // GNSS 授时精度高于网络源，但不给到 5ms 那么激进——避免单源主导合成。
+        // 系统网络时间受 18h 级同步间隔限制（实测曾偏 -434ms），必须给大 unc 压低权重。
+        double unc = gnss ? 10.0 : 150.0;
+        return new double[]{off, unc, e1 - e0};
+    }
+
     private static double wallGap() {
         long w1 = System.currentTimeMillis();
         long e = SystemClock.elapsedRealtime();

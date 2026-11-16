@@ -41,7 +41,7 @@ public class MainActivity extends Activity {
     private static final String[] ALL_KEYS = {
             "auto", "device", "taobao", "tmall", "jd", "meituan", "eleme",
             "vip", "pdd", "bili", "kuaishou", "xhs", "alipay", "rail", "unionpay",
-            "ntp"
+            "ntp", "gnss", "sysnet"
     };
 
     private static final int SCREEN_MAIN = 0;
@@ -735,6 +735,13 @@ public class MainActivity extends Activity {
                                 String.format("已校准: %+.3fs ±%.0fms", p.offset / 1000.0, p.unc));
                         dv.setTextColor(BLUE);
                     }
+                } else if (p != null && p.optional) {
+                    // GNSS / 系统网络时间：取不到属正常（室内无卫星信号），不该显示成红色失败
+                    if (tv != null) setTextIfChanged(tv, "--:--:--.-");
+                    if (dv != null) {
+                        setTextIfChanged(dv, "不可用");
+                        dv.setTextColor(0xFFBFC9D8);
+                    }
                 } else if (p != null && p.err != null) {
                     if (tv != null) setTextIfChanged(tv, "--:--:--.-");
                     if (dv != null) {
@@ -779,11 +786,17 @@ public class MainActivity extends Activity {
             tvFail.setVisibility(View.GONE);
         } else {
             syncBar.setVisibility(View.GONE);
-            if (synced) {
+            if ("未连接网络".equals(FloatingClockService.lastStatus)) {
+                // 断网由 NetworkCallback.onLost 即时置位，优先于"上次校时成功"的旧状态，
+                // 否则断网后界面会一直显示"✓ 已同步"，用户以为还在正常工作
+                st = "未连接网络";
+                stColor = 0xFFD2364B;
+            } else if (synced) {
                 st = "✓ 已同步";
                 stColor = GREEN;
             } else if (r != null) {
-                st = "同步失败";
+                // 分级文案：未连接网络 / 全部源超时 / 域名解析失败 / SSL 失败
+                st = r.text;
                 stColor = 0xFFD2364B;
             } else if (FloatingClockService.usingCachedOffset) {
                 st = "缓存校准 · 校时中";
