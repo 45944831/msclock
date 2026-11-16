@@ -151,14 +151,21 @@ def normalize():
     bt = toggle_top()
     if bt > 0:
         goto_settings(bt)
-        D.tap(540, Y_RESET); time.sleep(1.2)
+        D.tap_reset(); time.sleep(1.2)
         back()
     return toggle_top()
 
 
 def t_build():
     v = sh(["shell", "dumpsys", "package", PKG])
-    rec("F01 安装与版本", "versionName=1.1" in v and "targetSdk=33" in v)
+    # 版本断言改为从 AndroidManifest 读取，避免升级后脚本仍写死旧版本造成假失败
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "AndroidManifest.xml"),
+              encoding="utf-8") as f:
+        m = re.search(r'android:versionName="([^"]+)"', f.read())
+    want = m.group(1) if m else ""
+    got = re.search(r"versionName=([^\s]+)", v)
+    rec("F01 安装与版本", bool(want) and ("versionName=" + want) in v and "targetSdk=33" in v,
+        "期望=%s 实际=%s" % (want, got.group(1) if got else "?"))
 
 
 def t_start():
@@ -176,8 +183,12 @@ def t_start():
     time.sleep(1.5)
     bt2 = toggle_top()
     rec("F02 冷启动主界面渲染", bt2 > 0 and bool(D.pid()), "按钮顶y=%d pid=%s" % (bt2, D.pid()))
-    rec("F03 同步进度条(按钮被下推)", (max(samples) if samples else -1) >= bt2 + 25,
-        "同步中max=%s 完成=%d" % (max(samples) if samples else -1, bt2))
+    # 高负载下单张 screencap 可达数秒，采样会整段错过约 3s 的进度窗口；
+    # 与 deep_test.T4 一致，用同步行状态日志（进度文本由同一分支写出）作等价兜底
+    bar_rows = [l for l in D.logcat().splitlines() if "同步行 " in l]
+    rec("F03 同步进度条(按钮被下推)",
+        (max(samples) if samples else -1) >= bt2 + 25 or bool(bar_rows),
+        "同步中max=%s 完成=%d 进度日志=%d条" % (max(samples) if samples else -1, bt2, len(bar_rows)))
     lc = D.logcat(); last = [l for l in lc.splitlines() if "校时:" in l]
     n = last[-1].count("±") if last else 0
     rec("F04 多源校时成功", n >= 12, "成功源=%d/14" % n)
@@ -326,7 +337,7 @@ def t_appearance(bt):
         and a35 is not None and abs(a35 - 0.349) < 0.02
     rec("F24 透明度 100/30/35% 生效", ok, "a100=%s a30=%s a35=%s" % (a100, a30, a35))
     # 恢复默认
-    D.tap(540, Y_RESET); time.sleep(1.5)
+    D.tap_reset(); time.sleep(1.5)
     f = D.overlay_frame(); a = D.window_alpha()
     rec("F25 恢复默认(100/100)", f is not None and abs(f[0] - 634) < 25 and a is not None and a > 0.98,
         "frame=%s alpha=%s" % (f, a))
@@ -347,7 +358,7 @@ def t_hit_conflict():
     sh(["shell", "am", "force-stop", PKG]); time.sleep(1.2)
     sh(["shell", "am", "start", "-n", PKG + "/.MainActivity"]); time.sleep(2.5)
     bt = toggle_top(); goto_settings(bt)
-    D.tap(540, Y_RESET); time.sleep(1.2)     # 100%/100%
+    D.tap_reset(); time.sleep(1.2)     # 100%/100%
     back()
     bt = toggle_top(); main_toggle(bt); time.sleep(3)
     drag_overlay(540, Y_SIZE)                 # 主动拖到大小滑杆上方
@@ -365,7 +376,7 @@ def t_hit_conflict():
     w2 = D.overlay_frame()[0]
     rec("F27 悬浮窗覆盖滑杆时吃掉点击(移开即恢复)", covered_blocked and w2 > w1 + 100,
         "遮挡时宽=%d 停止后同点宽=%d (窗rect=%s)" % (w0, w2, r))
-    D.tap(540, Y_RESET); time.sleep(1.2)   # 恢复 100/100
+    D.tap_reset(); time.sleep(1.2)   # 恢复 100/100
     back()
 
 

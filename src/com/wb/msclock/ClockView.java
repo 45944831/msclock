@@ -30,6 +30,7 @@ public class ClockView extends View {
     private float padH, padV, gap, radius;
     private float wTime, wMs, baseline;
     private float uiScale = 1f;   // 悬浮框整体缩放：背景+字体等比
+    private boolean showMillis = true;  // 秒级省电模式：关闭后只画 HH:MM:SS，窗口自动收窄
 
     // 绘制全程零分配：时分秒与毫秒都写入复用字符缓冲
     private final char[] hms = {'0', '0', ':', '0', '0', ':', '0', '0'};
@@ -69,9 +70,17 @@ public class ClockView extends View {
         return uiScale;
     }
 
+    /** 秒级省电模式：隐藏毫秒位并收窄窗口，减少无用绘制面积 */
+    public void setShowMillis(boolean show) {
+        if (showMillis == show) return;
+        showMillis = show;
+        requestLayout();
+        invalidate();
+    }
+
     /** 100% 缩放下的内容宽高：不依赖当前布局结果，供按屏幕计算最大缩放 */
     public float getBaseWidth() {
-        return (padH * 2 + wTime + gap + wMs) / uiScale;
+        return (padH * 2 + wTime + (showMillis ? gap + wMs : 0)) / uiScale;
     }
 
     public float getBaseHeight() {
@@ -103,7 +112,7 @@ public class ClockView extends View {
 
     @Override
     protected void onMeasure(int wSpec, int hSpec) {
-        int w = (int) Math.ceil(padH * 2 + wTime + gap + wMs);
+        int w = (int) Math.ceil(padH * 2 + wTime + (showMillis ? gap + wMs : 0));
         Paint.FontMetrics fm = pTime.getFontMetrics();
         int h = (int) Math.ceil(padV * 2 + (fm.descent - fm.ascent));
         setMeasuredDimension(w, h);
@@ -119,19 +128,21 @@ public class ClockView extends View {
             lastSec = sec;
             fillHms(sec);
         }
-        int milli = (int) (now - sec * 1000L);   // floorDiv 保证落在 0..999
-        ms[1] = (char) ('0' + milli / 100);
-        ms[2] = (char) ('0' + (milli / 10) % 10);
-        ms[3] = (char) ('0' + milli % 10);
+        float x = padH;
+        float y = padV + baseline;
+        if (showMillis) {
+            int milli = (int) (now - sec * 1000L);   // floorDiv 保证落在 0..999
+            ms[1] = (char) ('0' + milli / 100);
+            ms[2] = (char) ('0' + (milli / 10) % 10);
+            ms[3] = (char) ('0' + milli % 10);
+        }
 
         int w = getWidth(), h = getHeight();
         rect.set(0, 0, w, h);
         c.drawRoundRect(rect, radius, radius, pBg);
 
-        float x = padH;
-        float y = padV + baseline;
         c.drawText(hms, 0, 8, x, y, pTime);
-        c.drawText(ms, 0, 4, x + wTime + gap, y, pMs);
+        if (showMillis) c.drawText(ms, 0, 4, x + wTime + gap, y, pMs);
     }
 
     /** 把本地时:分:秒写入复用缓冲，每秒仅执行一次 */

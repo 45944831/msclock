@@ -56,13 +56,19 @@ public class FloatingClockService extends Service {
     public static volatile TimeSync.Result lastResult = null;
     public static volatile long lastSyncAt = 0;
     public static volatile boolean syncing = false;
-    /** 最近一次全量校时完成时间 */
+    /** 最近一次全量校时完成时间（墙钟，仅用于展示/兼容） */
     public static volatile long lastFullSyncAt = 0;
+    /** 最近一次全量校时完成的单调钟时刻——刷新门槛必须用它，墙钟跳变会卡死刷新 */
+    public static volatile long lastFullSyncElapsed = 0;
+    /** 结果版本号：校时完成即 +1，界面据此立刻刷新，不必等 1s 轮询 */
+    public static volatile long syncVersion = 0;
 
     /** 悬浮窗外观：大小缩放(0.5~2.0)、不透明度(0.3~1.0)、刷新率(30/60fps) */
     public static volatile float scale = 1.0f;
     public static volatile float alpha = 1.0f;
     public static volatile int fps = 60;
+    /** 是否显示毫秒。关闭后进入秒级省电模式：不注册 Choreographer，每秒对齐唤醒一次 */
+    public static volatile boolean showMillis = true;
     /** 用户主动关闭后置位，阻止系统粘性复活；由主界面重新开启时清零 */
     public static volatile boolean userClosed = false;
     /** 本次由 startForegroundService 拉起：即使无权限也必须先履行 startForeground 义务再退出 */
@@ -86,6 +92,9 @@ public class FloatingClockService extends Service {
     private static volatile boolean pendingFull = false;
     public static volatile boolean syncingFull = false;
     private static volatile int syncGen = 0;
+    /** 本轮校时开始的单调钟时刻，用于看门狗：卡死时强制解锁，防止时间源页永远等不到结果 */
+    private static volatile long syncStartElapsed = 0;
+    private static final long SYNC_WATCHDOG_MS = 25_000L;
     private static Future<?> syncFuture;
     private static final ExecutorService syncExec = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "timesync-scan");
@@ -113,6 +122,7 @@ public class FloatingClockService extends Service {
             scale = clamp(sp.getFloat("scale", 1.0f), 0.5f, 2f);
             alpha = clamp(sp.getFloat("alpha", 1.0f), 0.3f, 1f);
             fps = sp.getInt("fps", 30) == 60 ? 60 : 30;   // 默认 30fps：60fps 持续重绘在中低端机上耗电明显
+            showMillis = sp.getBoolean("showMillis", true); // 默认显示毫秒（产品定位），可切秒级省电
             String s = sp.getString("source", "auto");
             source = TimeSync.hasKey(s) ? s : "auto";
             manualMs = (int) clamp(sp.getInt("manual", 0), -5000, 5000);
@@ -128,7 +138,9 @@ public class FloatingClockService extends Service {
                 boolean rebooted = elapsed < savedElapsed;
                 boolean clockChanged =
                         Math.abs((wall - elapsed) - (savedWall - savedElapsed)) > 2000;
-                long age = wall - savedWall;
+                // 缓存年龄用单调钟算：墙钟 age 在小步改钟(如调快几分钟)时会失真，
+                // 导致过期缓存被当成新鲜；elapsed 不受改钟影响。重启由 rebooted 单独拦截。
+                long age = elapsed - savedElapsed;
                 if (!rebooted && !clockChanged && age >= 0 && age < 24L * 3600_000L) {
                     cachedOffsetMs = sp.getLong("syncOffset", 0);
                     cachedValid = true;
@@ -175,6 +187,17 @@ public class FloatingClockService extends Service {
         }
         FloatingClockService inst = instance;
         if (inst != null) inst.ui.post(inst::applyFps);
+    }
+
+    /** 切换毫秒显示：关闭后停掉 Choreographer，改为每秒对齐唤醒一次，省电显著 */
+    public static void setShowMillis(Context c, boolean show) {
+        showMillis = show;
+        try {
+            prefs(c).edit().putBoolean("showMillis", show).apply();
+        } catch (Throwable ignored) {
+        }
+        FloatingClockService inst = instance;
+        if (inst != null) inst.ui.post(inst::applyRenderMode);
     }
 
     public static void applyAppearance() {
@@ -309,7 +332,10 @@ public class FloatingClockService extends Service {
             if (!p.ok) return;
             lastGoodOffsets.put(key, p.offset);
             TimeSync.Result r = lastResult;
-            if (r != null) TimeSync.mergeProbe(r, p);
+            if (r != null) {
+                TimeSync.mergeProbe(r, p);
+                syncVersion++;
+            }
             FloatingClockService inst = instance;
             if (inst != null && key.equals(source)) {
                 inst.applyResult(lastResult, true);
@@ -319,18 +345,31 @@ public class FloatingClockService extends Service {
 
     /** 后台执行一次校时；full=false 为 3 源快校时 */
     private static synchronized void startSync(final boolean full) {
+        long nowElapsed = SystemClock.elapsedRealtime();
         if (syncing) {
-            if (full) pendingFull = true;
-            return;
+            // 看门狗：后台校时超过 25s 还没回来（DNS 卡死 / 线程池被打满）时强制解锁。
+            // 否则打开时间源页触发的 requestFullSync() 只会挂成 pendingFull，
+            // 而上一轮永远不会结束——表现就是"时间源页再也不刷新"。
+            if (nowElapsed - syncStartElapsed < SYNC_WATCHDOG_MS) {
+                if (full) pendingFull = true;
+                return;
+            }
+            android.util.Log.w("MSClock", "校时看门狗触发，强制解锁 syncing");
+            syncGen++;
+            syncing = false;
+            syncingFull = false;
+            pendingFull = false;
+            if (syncFuture != null) syncFuture.cancel(true);
         }
-        if (!full && SystemClock.elapsedRealtime() < failureBackoffUntil) return;
+        if (!full && nowElapsed < failureBackoffUntil) return;
         syncing = true;
         syncingFull = full;
+        syncStartElapsed = nowElapsed;
         // 先给进度条一个正确的分母，避免扫描排队时显示 0/0
         TimeSync.progTotal = full ? TimeSync.KEYS.length - 1 : TimeSync.FAST_SOURCES;
         TimeSync.progDone.set(0);
         final int gen = ++syncGen;
-        final long tSubmit = SystemClock.elapsedRealtime();
+        final long tSubmit = nowElapsed;
         syncFuture = syncExec.submit(() -> {
             TimeSync.Result r;
             try {
@@ -340,31 +379,39 @@ public class FloatingClockService extends Service {
             }
             android.util.Log.d("MSClock", "startSync" + (full ? "全量" : "快") + " 完成 "
                     + (SystemClock.elapsedRealtime() - tSubmit) + "ms");
-            if (gen != syncGen) return;       // 已被取消/替代
-            if (r != null) {
-                lastResult = r;
-                lastSyncAt = System.currentTimeMillis();
-                lastStatus = r.text;
-                if (full) lastFullSyncAt = lastSyncAt;
-                if (r.ok) {
-                    failStreak = 0;
-                    failureBackoffUntil = 0;
-                } else {
-                    failStreak++;
-                    failureBackoffUntil =
-                            SystemClock.elapsedRealtime() + backoffMs(failStreak);
+            boolean current = (gen == syncGen);
+            boolean again = false;
+            // 状态清理放在同步块里并保证每轮都执行：任何异常/代次失效都不能把 syncing 卡在 true
+            synchronized (FloatingClockService.class) {
+                if (current) {
+                    if (r != null) {
+                        lastResult = r;
+                        lastSyncAt = System.currentTimeMillis();
+                        lastStatus = r.text;
+                        if (full) {
+                            lastFullSyncAt = lastSyncAt;
+                            lastFullSyncElapsed = SystemClock.elapsedRealtime();
+                        }
+                        if (r.ok) {
+                            failStreak = 0;
+                            failureBackoffUntil = 0;
+                        } else {
+                            failStreak++;
+                            failureBackoffUntil =
+                                    SystemClock.elapsedRealtime() + backoffMs(failStreak);
+                        }
+                    }
+                    syncing = false;
+                    syncingFull = false;
+                    syncStartElapsed = 0;
+                    again = pendingFull;
+                    pendingFull = false;
                 }
             }
-            syncing = false;
-            syncingFull = false;
+            if (!current) return;       // 已被看门狗取消/替代
             FloatingClockService inst = instance;
             if (inst != null && r != null) inst.applyResult(r, false);
-
-            boolean again;
-            synchronized (FloatingClockService.class) {
-                again = pendingFull;
-                pendingFull = false;
-            }
+            syncVersion++;              // 结果已就绪：界面立刻重取，不等 1s 轮询
             if (again) startSync(true);
         });
     }
@@ -387,16 +434,61 @@ public class FloatingClockService extends Service {
     private boolean moved;
     private Runnable longPress;
     private int frameTick;
+    private boolean pinching;
+    private int pinchStartDist;
+    private float pinchStartScale;
 
     private ConnectivityManager.NetworkCallback netCallback;
     private BroadcastReceiver screenReceiver;
     private boolean screenOff;
+
+    /** 秒级省电驱动：对齐到整秒边界唤醒一次，只画秒，不注册 vsync */
+    private final Runnable secondTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!running || view == null || choreographer == null || screenOff || showMillis) return;
+            if (!Settings.canDrawOverlays(FloatingClockService.this)) {
+                ui.post(FloatingClockService.this::quit);
+                return;
+            }
+            view.invalidate();
+            scheduleSecondTick();
+        }
+    };
+
+    /** 计算距离下一个整秒边界的毫秒数，保证秒跳变及时显示 */
+    private void scheduleSecondTick() {
+        ui.removeCallbacks(secondTick);
+        if (!running || view == null || choreographer == null || screenOff || showMillis) return;
+        long wall = (long) baseServerMs + (SystemClock.elapsedRealtime() - baseElapsed);
+        long delay = 1000L - Math.floorMod(wall, 1000L);
+        if (delay < 30L) delay = 1000L + delay;   // 边界附近留给下一秒，避免同秒重复画
+        ui.postDelayed(secondTick, delay);
+    }
+
+    /** 应用渲染模式：毫秒→Choreographer；秒级→移除帧回调并对齐整秒唤醒 */
+    private void applyRenderMode() {
+        if (view == null) return;
+        view.setShowMillis(showMillis);
+        if (choreographer != null) choreographer.removeFrameCallback(frameCallback);
+        ui.removeCallbacks(secondTick);
+        if (screenOff) return;
+        if (showMillis) {
+            lastFrameNs = 0;
+            choreographer.postFrameCallback(frameCallback);
+        } else {
+            view.invalidate();
+            scheduleSecondTick();
+        }
+    }
 
     /** 唯一帧驱动：按目标刷新率节流，屏幕熄灭时 vsync 停止，循环自然暂停 */
     private final Choreographer.FrameCallback frameCallback = new Choreographer.FrameCallback() {
         @Override
         public void doFrame(long frameTimeNanos) {
             if (!running || view == null || choreographer == null) return;
+            // 切到秒级省电模式后不再续帧，让 vsync 循环自然停止
+            if (!showMillis) return;
             // 权限被撤销后窗口会残留在屏幕上但不可见，约每秒检查一次并主动退出
             if ((++frameTick & 63) == 0 && !Settings.canDrawOverlays(FloatingClockService.this)) {
                 ui.post(FloatingClockService.this::quit);
@@ -501,13 +593,14 @@ public class FloatingClockService extends Service {
         running = true;
         instance = this;
         view.setUiScale(scale);
+        view.setShowMillis(showMillis);
         view.setAccent(usingCachedOffset
                 ? 0xFF8A93A6
                 : TimeSync.colorOf("auto".equals(source) ? "ntp" : source));
 
         choreographer = Choreographer.getInstance();
         applyFps();
-        if (!screenOff) choreographer.postFrameCallback(frameCallback);
+        applyRenderMode();   // 按 showMillis 决定毫秒帧循环还是秒级对齐唤醒
 
         view.post(new Runnable() {
             @Override
@@ -529,8 +622,9 @@ public class FloatingClockService extends Service {
         registerScreenReceiver();
         ui.postDelayed(() -> startSync(false), 150);
         ui.postDelayed(() -> {
-            if (lastFullSyncAt == 0
-                    || System.currentTimeMillis() - lastFullSyncAt > 60_000) startSync(true);
+            // 用单调钟判断，避免系统时间被校时/手动修改后 60s 门槛永不满足
+            if (lastFullSyncElapsed == 0
+                    || SystemClock.elapsedRealtime() - lastFullSyncElapsed > 60_000) startSync(true);
         }, 6000);
         if (!screenOff) {
             ui.postDelayed(resync, 60_000);
@@ -569,6 +663,7 @@ public class FloatingClockService extends Service {
     private void enterScreenOff() {
         screenOff = true;
         if (choreographer != null) choreographer.removeFrameCallback(frameCallback);
+        ui.removeCallbacks(secondTick);
         ui.removeCallbacks(resync);
         ui.removeCallbacks(fullResync);
     }
@@ -577,7 +672,12 @@ public class FloatingClockService extends Service {
         screenOff = false;
         if (!running || choreographer == null) return;
         lastFrameNs = 0;                 // 亮屏立即重绘，避免显示熄屏前的旧时间
-        choreographer.postFrameCallback(frameCallback);
+        if (showMillis) {
+            choreographer.postFrameCallback(frameCallback);
+        } else {
+            view.invalidate();
+            scheduleSecondTick();
+        }
         ui.removeCallbacks(resync);
         ui.removeCallbacks(fullResync);
         ui.postDelayed(resync, 60_000);
@@ -611,18 +711,35 @@ public class FloatingClockService extends Service {
                 startY = lp.y;
                 downAt = SystemClock.uptimeMillis();
                 moved = false;
+                pinching = false;
                 longPress = this::quit;
                 ui.postDelayed(longPress, 900);
                 return true;
+            case MotionEvent.ACTION_POINTER_DOWN:
+                // 第二根手指落下：进入捏合缩放，取消长按关闭与拖动语义
+                if (e.getPointerCount() >= 2) {
+                    pinching = true;
+                    moved = true;
+                    cancelLongPress();
+                    pinchStartDist = pinchDistance(e);
+                    pinchStartScale = Math.min(scale, maxScaleForScreen());
+                }
+                return true;
             case MotionEvent.ACTION_MOVE: {
+                if (pinching && e.getPointerCount() >= 2) {
+                    int dist = pinchDistance(e);
+                    if (pinchStartDist > dp(20)) {
+                        float s = Math.max(0.5f, Math.min(2f,
+                                pinchStartScale * dist / pinchStartDist));
+                        FloatingClockService.previewAppearance(s, alpha);
+                    }
+                    return true;
+                }
                 int dx = (int) e.getRawX() - dragDownX;
                 int dy = (int) e.getRawY() - dragDownY;
                 if (Math.abs(dx) > dp(6) || Math.abs(dy) > dp(6)) {
                     moved = true;
-                    if (longPress != null) {
-                        ui.removeCallbacks(longPress);
-                        longPress = null;
-                    }
+                    cancelLongPress();
                 }
                 lp.x = startX + dx;
                 lp.y = startY + dy;
@@ -633,17 +750,26 @@ public class FloatingClockService extends Service {
                 }
                 return true;
             }
+            case MotionEvent.ACTION_POINTER_UP:
+                if (pinching) {
+                    // 捏合结束：持久化当前缩放（取屏幕上实际生效的值）
+                    float s = view != null ? view.getUiScale() : scale;
+                    FloatingClockService.setAppearance(this, s, alpha);
+                    pinching = false;
+                }
+                return true;
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
-                if (longPress != null) {
-                    ui.removeCallbacks(longPress);
-                    longPress = null;
+                cancelLongPress();
+                if (pinching) {
+                    pinching = false;   // POINTER_UP 已持久化；抬起剩余手指不再触发拖动/点击
+                    return true;
                 }
-                if (clampPosition()) {
-                    try {
-                        wm.updateViewLayout(view, lp);
-                    } catch (Throwable ignored) {
-                    }
+                clampPosition();
+                snapToEdge();           // 边缘磁吸：松手后靠近左右边缘时吸附
+                try {
+                    wm.updateViewLayout(view, lp);
+                } catch (Throwable ignored) {
                 }
                 savePosition();
                 if (e.getActionMasked() == MotionEvent.ACTION_UP
@@ -653,6 +779,30 @@ public class FloatingClockService extends Service {
                 return true;
         }
         return false;
+    }
+
+    private void cancelLongPress() {
+        if (longPress != null) {
+            ui.removeCallbacks(longPress);
+            longPress = null;
+        }
+    }
+
+    /** 两指间距（像素） */
+    private int pinchDistance(MotionEvent e) {
+        float dx = e.getX(0) - e.getX(1);
+        float dy = e.getY(0) - e.getY(1);
+        return (int) Math.sqrt(dx * dx + dy * dy);
+    }
+
+    /** 边缘磁吸：松手后若距左/右边缘在阈值内，则吸附到边缘；阈值随窗口宽度自适应 */
+    private void snapToEdge() {
+        if (view == null || lp == null) return;
+        int sw = getResources().getDisplayMetrics().widthPixels;
+        int maxX = Math.max(0, sw - view.getWidth());
+        int threshold = Math.max(dp(24), view.getWidth() / 3);
+        if (lp.x < threshold) lp.x = 0;
+        else if (lp.x > maxX - threshold) lp.x = maxX;
     }
 
     private void openApp() {
@@ -787,6 +937,8 @@ public class FloatingClockService extends Service {
                 view.setAccent(accent);
                 view.invalidate();
             }
+            // 偏移重锚后对齐节奏会变，秒级模式下重排整秒唤醒
+            if (!showMillis && !screenOff) scheduleSecondTick();
         });
     }
 
@@ -848,6 +1000,7 @@ public class FloatingClockService extends Service {
         syncing = false;
         syncingFull = false;
         pendingFull = false;
+        syncStartElapsed = 0;
         if (syncFuture != null) syncFuture.cancel(true);
         if (choreographer != null) choreographer.removeFrameCallback(frameCallback);
         if (netCallback != null) {

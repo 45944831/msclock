@@ -44,7 +44,7 @@ def main():
     # 1) 恢复默认并验证
     seeks = on_settings(bt)
     rec("A00 设置页渲染", len(seeks) == 2, str(seeks))
-    D.tap(540, U.Y_RESET); time.sleep(1.3)
+    D.tap_reset(); time.sleep(1.3)
     U.back()
     bt = U.toggle_top()
     U.main_toggle(bt); time.sleep(3)
@@ -76,7 +76,7 @@ def main():
         "100=%s 30=%s 35=%s" % (a100, a30, a35))
 
     # 5) 恢复默认
-    D.tap(540, U.Y_RESET); time.sleep(1.5)
+    D.tap_reset(); time.sleep(1.5)
     f = D.overlay_frame(); a = D.window_alpha()
     rec("A05 恢复默认按钮(100/100)", f is not None and abs(f[0] - 634) < 25 and a and a > 0.98,
         "frame=%s alpha=%s" % (f, a))
@@ -96,7 +96,7 @@ def main():
     U.sh(["shell", "am", "force-stop", PKG]); time.sleep(1.2)
     U.sh(["shell", "am", "start", "-n", PKG + "/.MainActivity"]); time.sleep(2.5)
     bt = U.toggle_top(); on_settings(bt)
-    D.tap(540, U.Y_RESET); time.sleep(1.2); U.back()
+    D.tap_reset(); time.sleep(1.2); U.back()
     bt = U.toggle_top(); U.main_toggle(bt); time.sleep(3)
     U.drag_overlay(300, 1900); time.sleep(0.8)
     r0 = U.rect()
@@ -109,7 +109,7 @@ def main():
         "重启前=%s 重启后=%s" % (r0, r1))
 
     # 收尾：100% + 停止 + 主界面
-    D.tap(540, U.Y_RESET); time.sleep(1.2); U.back()
+    D.tap_reset(); time.sleep(1.2); U.back()
     sh(["shell", "am", "start", "-n", PKG + "/.MainActivity"]); time.sleep(0.4); sh(["shell", "am", "broadcast", "-a", "com.wb.msclock.action.CMD", "-n", PKG + "/.CmdReceiver", "--receiver-include-background", "--es", "cmd", "stop"]); time.sleep(1.5)
     crash = U.sh(["shell", "logcat", "-d", "-b", "crash"]).count(PKG)
     rec("A08 外观专项无崩溃", crash == 0, "crash=%d" % crash)

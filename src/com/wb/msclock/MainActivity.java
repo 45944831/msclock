@@ -8,6 +8,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
@@ -66,6 +67,7 @@ public class MainActivity extends Activity {
     private boolean lastToggleOn, lastToggleGranted, toggleDrawn;
     private String lastMainTime = "", lastAdjust = "", lastSyncText = "";
     private int tickCount;
+    private long lastSeenSyncVersion = -1;
     private long lastAppearanceAt = 0;
 
     // 时间源页控件
@@ -82,9 +84,22 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             if (isFinishing() || isDestroyed()) return;
-            updateClockTexts();
-            if (++tickCount % 5 == 0) updateValues();
-            handler.postDelayed(this, 200);
+            try {
+                updateClockTexts();
+                // 校时结果一落地就整页刷新（含时间源卡片），不用等下一个 1s 轮询点
+                long v = FloatingClockService.syncVersion;
+                if (v != lastSeenSyncVersion) {
+                    lastSeenSyncVersion = v;
+                    updateValues();
+                } else if (++tickCount % 5 == 0) {
+                    updateValues();
+                }
+            } catch (Throwable t) {
+                // 单次刷新异常不能让定时链断裂——否则界面从此冻结，表现为"不刷新"
+                android.util.Log.w("MSClock", "tick 刷新异常", t);
+            } finally {
+                handler.postDelayed(this, 200);
+            }
         }
     };
 
@@ -102,9 +117,9 @@ public class MainActivity extends Activity {
         handler.postDelayed(() -> {
             if (isFinishing() || isDestroyed()) return;
             if (FloatingClockService.isAlive()) return;
-            long now = System.currentTimeMillis();
-            if (FloatingClockService.lastFullSyncAt == 0
-                    || now - FloatingClockService.lastFullSyncAt > 60_000) {
+            long now = SystemClock.elapsedRealtime();
+            if (FloatingClockService.lastFullSyncElapsed == 0
+                    || now - FloatingClockService.lastFullSyncElapsed > 60_000) {
                 FloatingClockService.requestFullSync();
             }
         }, 6000);
@@ -529,7 +544,7 @@ public class MainActivity extends Activity {
         tvFpsVal.setTextColor(BLUE);
         fpsRow.addView(tvFpsVal);
         fpsCard.addView(fpsRow);
-        TextView fpsHint = bodyText("60fps 更顺滑 / 30fps 更省电 · 点击切换", 11);
+        TextView fpsHint = bodyText("仅毫秒模式生效 · 60fps 顺滑 / 30fps 省电 · 点击切换", 11);
         fpsHint.setTextColor(SUB);
         fpsHint.setPadding(0, (int) (6 * d), 0, 0);
         fpsCard.addView(fpsHint);
@@ -541,13 +556,40 @@ public class MainActivity extends Activity {
         });
         settingsView.addView(fpsCard);
 
+        // 毫秒显示开关：关闭后进入秒级省电模式（停 vsync，每秒唤醒一次）
+        LinearLayout msCard = card(d);
+        LinearLayout msRow = new LinearLayout(this);
+        msRow.setOrientation(LinearLayout.HORIZONTAL);
+        msRow.setGravity(Gravity.CENTER_VERTICAL);
+        msRow.addView(bodyText("显示毫秒", 15));
+        msRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+        final TextView tvMsVal = bodyText(FloatingClockService.showMillis ? "开启" : "关闭", 13);
+        tvMsVal.setTextColor(BLUE);
+        msRow.addView(tvMsVal);
+        msCard.addView(msRow);
+        TextView msHint = bodyText("关闭后仅显示到秒 · 每秒唤醒一次，显著省电", 11);
+        msHint.setTextColor(SUB);
+        msHint.setPadding(0, (int) (6 * d), 0, 0);
+        msCard.addView(msHint);
+        msCard.setOnClickListener(v -> {
+            boolean next = !FloatingClockService.showMillis;
+            FloatingClockService.setShowMillis(this, next);
+            tvMsVal.setText(next ? "开启" : "关闭");
+            toast(next ? "已开启毫秒（高刷）" : "已关闭毫秒（秒级省电）");
+        });
+        settingsView.addView(msCard);
+
         // 恢复默认
         TextView reset = pillButton("恢复外观默认（100% / 100%）", d, v -> {
             FloatingClockService.setAppearance(this, 1f, 1f);
+            // 毫秒显示也是外观的一部分：省电模式关闭后点恢复默认应回到完整显示，
+            // 否则窗口宽度基准与默认不一致，用户也会觉得"恢复默认"没恢复全。
+            FloatingClockService.setShowMillis(this, true);
             sizeSeek.setProgress(50);
             alphaSeek.setProgress(100);
             tvSizeVal.setText("100%");
             tvAlphaVal.setText("100%");
+            tvMsVal.setText("开启");
             toast("已恢复默认");
         });
         LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(
@@ -557,13 +599,9 @@ public class MainActivity extends Activity {
         settingsView.addView(reset);
     }
 
-    /** 通用白卡容器 */
+    /** 通用白卡容器（委托给 UiKit） */
     private LinearLayout card(float d) {
-        LinearLayout c = new LinearLayout(this);
-        c.setOrientation(LinearLayout.VERTICAL);
-        c.setBackground(bg(CARD, 14 * d, 1));
-        c.setPadding((int) (16 * d), (int) (14 * d), (int) (16 * d), (int) (14 * d));
-        return c;
+        return UiKit.card(this, CARD, d);
     }
 
     // ---------------- 界面切换 ----------------
@@ -586,10 +624,12 @@ public class MainActivity extends Activity {
         tvTitle.setText("时间源");
         tvBack.setVisibility(View.VISIBLE);
         if (scroll != null) scroll.post(() -> scroll.scrollTo(0, 0));
-        // 打开时间源页说明用户要看全量数据：数据过期或还没跑过就补一次
-        long now = System.currentTimeMillis();
-        if (FloatingClockService.lastFullSyncAt == 0
-                || now - FloatingClockService.lastFullSyncAt > 60_000) {
+        // 用户主动打开时间源页＝明确要求看全量数据：强制补一次全量校时。
+        // 只保留 5s 防抖防止来回切页刷请求；旧版 60s 门槛会让"刚打开就点进去"完全不刷新。
+        // 门槛改用单调钟，避免系统时间被校时/手动改小后永不再触发。
+        long now = SystemClock.elapsedRealtime();
+        if (FloatingClockService.lastFullSyncElapsed == 0
+                || now - FloatingClockService.lastFullSyncElapsed > 5_000) {
             FloatingClockService.requestFullSync();
         }
         updateValues();
@@ -908,77 +948,30 @@ public class MainActivity extends Activity {
         return TimeSync.colorOf(key);
     }
 
-    /** 无 Calendar / String.format 的时间格式化，固定 8 或 10 字符 */
+    /** 时间格式化委托给可单测的 TimeMath（时区偏移显式传入，避免格式化内部依赖系统时区） */
     private static String fmt(long ms, int decimals) {
-        long sec = Math.floorDiv(ms, 1000L);
-        int milli = (int) (ms - sec * 1000L);
         int offsetSec = java.util.TimeZone.getDefault().getOffset(ms) / 1000;
-        int sod = (int) Math.floorMod(sec + offsetSec, 86400L);
-        int hh = sod / 3600, mm = (sod % 3600) / 60, ss = sod % 60;
-        char[] b = new char[decimals >= 1 ? 10 : 8];
-        b[0] = (char) ('0' + hh / 10);
-        b[1] = (char) ('0' + hh % 10);
-        b[2] = ':';
-        b[3] = (char) ('0' + mm / 10);
-        b[4] = (char) ('0' + mm % 10);
-        b[5] = ':';
-        b[6] = (char) ('0' + ss / 10);
-        b[7] = (char) ('0' + ss % 10);
-        if (decimals >= 1) {
-            b[8] = '.';
-            b[9] = (char) ('0' + milli / 100);
-        }
-        return new String(b);
+        return TimeMath.formatClock(ms, decimals >= 1, offsetSec);
     }
 
+    // 以下工具方法均委托给无状态 UiKit，保持 MainActivity 调用点不变、行为一致
     private TextView sectionLabel(String s) {
-        TextView tv = new TextView(this);
-        tv.setText(s);
-        tv.setTextColor(TEXT);
-        tv.setTextSize(14);
-        tv.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = (int) (18 * getResources().getDisplayMetrics().density);
-        lp.bottomMargin = (int) (10 * getResources().getDisplayMetrics().density);
-        tv.setLayoutParams(lp);
-        return tv;
+        return UiKit.sectionLabel(this, TEXT, s, getResources().getDisplayMetrics().density);
     }
 
     private TextView bodyText(String s, int size) {
-        TextView tv = new TextView(this);
-        tv.setText(s);
-        tv.setTextSize(size);
-        tv.setTextColor(TEXT);
-        return tv;
+        return UiKit.bodyText(this, TEXT, s, size);
     }
 
     private TextView pillButton(String s, float d, View.OnClickListener l) {
-        TextView tv = new TextView(this);
-        tv.setText(s);
-        tv.setTextSize(18);
-        tv.setTextColor(TEXT);
-        tv.setGravity(Gravity.CENTER);
-        tv.setBackground(bg(0xFFF2F5FA, 100 * d, 0));
-        tv.setOnClickListener(l);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                (int) (34 * d), (int) (34 * d));
-        lp.leftMargin = (int) (8 * d);
-        tv.setLayoutParams(lp);
-        return tv;
+        return UiKit.pillButton(this, TEXT, s, d, l);
     }
 
     private GradientDrawable bg(int color, float radius, int strokeColor) {
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(color);
-        g.setCornerRadius(radius);
-        if (strokeColor != 0) {
-            g.setStroke(Math.max(1, (int) (getResources().getDisplayMetrics().density)), strokeColor);
-        }
-        return g;
+        return UiKit.bg(this, color, radius, strokeColor);
     }
 
     private void toast(String s) {
-        android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_SHORT).show();
+        UiKit.toast(this, s);
     }
 }

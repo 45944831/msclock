@@ -10,23 +10,47 @@ PKG="com.wb.msclock"
 OUT="build"
 APK_NAME="毫秒悬浮时钟.apk"
 
+# 跨平台：Windows 构建工具带 .exe，类 Unix 不带
+EXE=""
+if [ -f "$BT/aapt2.exe" ]; then EXE=".exe"; fi
+AAPT2="$BT/aapt2$EXE"
+ZIPALIGN="$BT/zipalign$EXE"
+# Python：优先环境变量 PYTHON，其次 python3/python，最后 Windows 常见路径
+if [ -n "${PYTHON:-}" ]; then
+    PY="$PYTHON"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+elif command -v python >/dev/null 2>&1; then
+    PY="python"
+else
+    PY="D:/python/python.exe"
+fi
+
 cd "$(dirname "$0")"
+# 版本号只从 AndroidManifest 读取：aapt2 link 的 --version-* 会覆盖清单值，
+# 之前脚本写死 3/1.2，导致清单升版后 APK 仍是旧版本。
+VC=$(sed -n 's/.*android:versionCode="\([0-9][0-9]*\)".*/\1/p' AndroidManifest.xml | head -1)
+VN=$(sed -n 's/.*android:versionName="\([^"]*\)".*/\1/p' AndroidManifest.xml | head -1)
+VC="${VC:-3}"
+VN="${VN:-1.2}"
+echo "版本: versionCode=$VC versionName=$VN"
+
 rm -rf "$OUT"
 mkdir -p "$OUT/gen" "$OUT/classes" "$OUT/dex"
 
 echo "==> 1/6 编译资源"
-"$BT/aapt2.exe" compile --dir res -o "$OUT/res.zip"
+"$AAPT2" compile --dir res -o "$OUT/res.zip"
 
 echo "==> 2/6 链接资源与清单"
-"$BT/aapt2.exe" link \
+"$AAPT2" link \
     -o "$OUT/base.apk" \
     -I "$PLATFORM" \
     --manifest AndroidManifest.xml \
     --java "$OUT/gen" \
     --min-sdk-version 26 \
     --target-sdk-version 33 \
-    --version-code 3 \
-    --version-name 1.2 \
+    --version-code "$VC" \
+    --version-name "$VN" \
     "$OUT/res.zip"
 
 echo "==> 3/6 编译 Java"
@@ -45,7 +69,7 @@ echo "   编译通过，class 文件数: $(find "$OUT/classes" -name '*.class' |
 
 echo "==> 4/6 转 dex"
 find "$OUT/classes" -name "*.class" > "$OUT/classes.txt"
-for c in MainActivity FloatingClockService ClockView TimeSync; do
+for c in MainActivity FloatingClockService ClockView TimeSync TimeMath UiKit CmdReceiver; do
     if [ ! -f "$OUT/classes/com/wb/msclock/$c.class" ]; then
         echo "!!! 缺少类文件: $c.class —— 构建中止 !!!"
         exit 1
@@ -59,7 +83,7 @@ done
 
 echo "==> 5/6 打包"
 cp "$OUT/base.apk" "$OUT/unsigned.apk"
-D:/python/python.exe - "$OUT/unsigned.apk" "$OUT/dex/classes.dex" <<'PY'
+"$PY" - "$OUT/unsigned.apk" "$OUT/dex/classes.dex" <<'PY'
 import sys, zipfile, shutil, os
 apk, dex = sys.argv[1], sys.argv[2]
 tmp = apk + ".tmp"
@@ -72,7 +96,7 @@ os.remove(tmp)
 print("   classes.dex 已加入")
 PY
 
-"$BT/zipalign.exe" -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
+"$ZIPALIGN" -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 
 echo "==> 6/6 签名"
 KS="debug.keystore"   # 持久化密钥库，避免每次构建换签名导致无法覆盖安装

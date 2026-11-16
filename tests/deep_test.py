@@ -150,24 +150,35 @@ def white_bands(path, th=300):
     return out
 
 def clock_dark_box(path):
-    """悬浮钟深色框 bbox：仅统计含 ≥200px 连续暗色段的行（抗文字干扰）"""
+    """悬浮钟深色框 bbox：仅统计含足够长连续暗色段的行（抗文字干扰）。
+    扫描范围优先取悬浮窗实际 frame——窗口缩放/边缘磁吸后位置会变，
+    固定区域会把移到 x=0 或缩小的窗口切掉，造成假阴性(visible=True 但 dark=None)。"""
     w, h, nch, buf = load_png(path)
     y0, y1 = P["box_y"]
     x0, x1 = P["box_x"]
+    try:
+        r = overlay_rect()
+        if r:
+            x0, y0 = max(0, r[0] - 4), max(0, r[1] - 4)
+            x1, y1 = min(w, r[2] + 4), min(h, r[3] + 4)
+    except Exception:
+        pass
+    # 连续暗色段阈值：默认 200px，窄窗口按宽度自适应（最低 80px）
+    need = max(80, min(200, int((x1 - x0) * 0.4)))
     xs, ys = [], []
     for y in range(y0, y1, 3):
         run = best = 0
         for x in range(x0, x1):
-            r, g, b = px(buf, w, nch, x, y)
-            if r < 70 and g < 70 and b < 80:
+            r_, g_, b_ = px(buf, w, nch, x, y)
+            if r_ < 70 and g_ < 70 and b_ < 80:
                 run += 1
                 best = max(best, run)
             else:
                 run = 0
-        if best >= 200:
+        if best >= need:
             for x in range(x0, x1):
-                r, g, b = px(buf, w, nch, x, y)
-                if r < 70 and g < 70 and b < 80:
+                r_, g_, b_ = px(buf, w, nch, x, y)
+                if r_ < 70 and g_ < 70 and b_ < 80:
                     xs.append(x); ys.append(y)
     if not xs:
         return None
@@ -225,6 +236,24 @@ def rec(name, ok, note=""):
 
 def tap(x, y):
     sh(["shell", "input", "tap", str(x), str(y)])
+
+def tap_reset():
+    """动态定位并点击「恢复外观默认」按钮。
+    设置页新增卡片会让按钮下移，硬编码坐标会误点到相邻卡片（如显示毫秒开关），
+    造成外观测试连锁假失败。用 uiautomator 按文本取真实 bounds，失败再回退常量。"""
+    try:
+        sh(["shell", "uiautomator", "dump", "/sdcard/win.xml"])
+        xml = sh(["shell", "cat", "/sdcard/win.xml"])
+        m = re.search(r'<node[^>]*text="恢复外观默认[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml)
+        if not m:
+            m = re.search(r'<node[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"[^>]*text="恢复外观默认[^"]*"', xml)
+        if m:
+            l, t, r, b = map(int, m.groups())
+            tap((l + r) // 2, (t + b) // 2)
+            return
+    except Exception:
+        pass
+    tap(*P["reset"])
 
 def swipe(x1, y1, x2, y2, ms=300):
     sh(["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(ms)])
@@ -575,7 +604,7 @@ def t22t25():
     tap_entry("set"); time.sleep(1.8)
     seeks0 = find_seeks(shot("_t_set0.png"))
     if len(seeks0) >= 2:
-        tap(*TAP_RESET); time.sleep(1.2)
+        tap_reset(); time.sleep(1.2)
     sh(["shell", "input", "keyevent", "KEYCODE_BACK"]); time.sleep(1.0)
     # 基线：默认 100% 下窗口 frame（开悬浮钟后系统记录）
     ensure_overlay()
@@ -642,7 +671,7 @@ def t22t25():
     tap_entry("set"); time.sleep(1.8)
     seeks5 = find_seeks(shot("_t_set5.png"))
     if len(seeks5) >= 2:
-        tap(*TAP_RESET); time.sleep(1.2)
+        tap_reset(); time.sleep(1.2)
     ensure_overlay(); time.sleep(1)
     a3 = window_alpha()
     rec("T25 恢复默认(100%/100%)", a3 is not None and a3 > 0.95, "alpha=%s" % a3)

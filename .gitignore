@@ -11,6 +11,7 @@ debug.keystore
 *.log
 *.pyc
 __pycache__/
+tests/jvm/classes/
 _*.py
 _*.png
 _*.md

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-test:
+    name: 校时算法单测 (JVM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: 运行 TimeMath 单测
+        working-directory: tests/jvm
+        run: bash run_tests.sh
+
+  build-apk:
+    name: 手工链构建 APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: 安装 Android SDK 命令行工具与 build-tools 34
+        run: |
+          sudo apt-get update -qq
+          SDK=$HOME/android-sdk
+          mkdir -p "$SDK/cmdline-tools"
+          curl -sSL -o /tmp/cmdtools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdtools.zip -d "$SDK/cmdline-tools"
+          mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" \
+            "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          echo "ANDROID_SDK=$SDK" >> $GITHUB_ENV
+      - name: 构建并签名
+        run: bash build_apk.sh
+      - name: 校验产物
+        run: |
+          test -f "毫秒悬浮时钟.apk"
+          echo "APK 大小: $(stat -c%s '毫秒悬浮时钟.apk') bytes"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msclock-apk
+          path: 毫秒悬浮时钟.apk

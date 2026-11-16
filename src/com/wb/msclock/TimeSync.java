@@ -11,6 +11,7 @@ import java.net.InetAddress;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -209,7 +210,9 @@ public class TimeSync {
     }
 
     private static Result calibrate(boolean full) {
-        long tStart = System.currentTimeMillis();
+        // 调度/计时同样走单调钟：校时中途若系统 NTP 跳钟或用户改时间，
+        // 墙钟 deadline 会被拉长或缩短，正常源会被误判「响应超时」。
+        long tStart = SystemClock.elapsedRealtime();
         Result r = new Result();
         r.full = full;
         final int[] idx;
@@ -229,9 +232,9 @@ public class TimeSync {
             final int i = idx[k];
             final int slot = k;
             futures.add(POOL.submit(() -> {
-                long t0 = System.currentTimeMillis();
+                long t0 = SystemClock.elapsedRealtime();
                 Probe p = probeOne(i, !full);
-                android.util.Log.d("MSClock", "源耗时 " + p.name + " " + (System.currentTimeMillis() - t0) + "ms "
+                android.util.Log.d("MSClock", "源耗时 " + p.name + " " + (SystemClock.elapsedRealtime() - t0) + "ms "
                         + (p.ok ? "ok" : (p.err == null ? "fail" : p.err)));
                 if (sid == scanSeq.get()) {
                     slots[slot] = p;
@@ -240,11 +243,11 @@ public class TimeSync {
                 return p;
             }));
         }
-        long deadline = System.currentTimeMillis() + (full ? 6000 : 2200);
+        long deadline = SystemClock.elapsedRealtime() + (full ? 6000 : 2200);
         for (int k = 0; k < futures.size(); k++) {
             Future<Probe> f = futures.get(k);
             try {
-                long wait = Math.max(1, deadline - System.currentTimeMillis());
+                long wait = Math.max(1, deadline - SystemClock.elapsedRealtime());
                 slots[k] = f.get(wait, TimeUnit.MILLISECONDS);
             } catch (Exception e) {
                 f.cancel(true);
@@ -256,7 +259,7 @@ public class TimeSync {
             r.list.add(slots[k]);
         }
         finalizeResult(r, full);
-        android.util.Log.d("MSClock", "校时总耗时 " + (System.currentTimeMillis() - tStart) + "ms ("
+        android.util.Log.d("MSClock", "校时总耗时 " + (SystemClock.elapsedRealtime() - tStart) + "ms ("
                 + (full ? "全量" : "快") + ")");
         return r;
     }
@@ -265,7 +268,7 @@ public class TimeSync {
     public static Probe calibrateSingle(String key) {
         final int i = indexOf(key);
         if (i < 0) return null;
-        long t0 = System.currentTimeMillis();
+        long t0 = SystemClock.elapsedRealtime();
         Future<Probe> f = POOL.submit(() -> probeOne(i, false));
         Probe p;
         try {
@@ -275,7 +278,7 @@ public class TimeSync {
             p = failed(i, "响应超时");
         }
         logSingle(p);
-        android.util.Log.d("MSClock", "单源总耗时 " + (System.currentTimeMillis() - t0) + "ms");
+        android.util.Log.d("MSClock", "单源总耗时 " + (SystemClock.elapsedRealtime() - t0) + "ms");
         return p;
     }
 
@@ -303,15 +306,20 @@ public class TimeSync {
     }
 
     private static void finalizeResult(Result r, boolean full) {
-        // 防 CDN 缓存 Date 头：与 NTP 基准偏差超过 2 秒的源判为无效
-        Probe ntpBase = null;
-        for (Probe p : r.list) if (p.ok && "阿里云NTP".equals(p.name)) ntpBase = p;
-        if (ntpBase != null) {
+        // 缓存 Date 头已在 probeDate 内用「跨秒采样的 Date 是否变化」前置检测；
+        // 这里不再以 NTP 为唯一基准做 ±2s 硬剔除——那会让一个离群 NTP 误杀全部好源。
+        // 仅对与全局中位数偏差超过 2s 的源放大不确定度（降权），保留兜底但不破坏合成。
+        int okCnt = 0;
+        double[] offs = new double[r.list.size()];
+        for (Probe p : r.list) if (p.ok) offs[okCnt++] = p.offset;
+        if (okCnt >= 3) {
+            double[] sorted = java.util.Arrays.copyOf(offs, okCnt);
+            java.util.Arrays.sort(sorted);
+            double median = sorted[okCnt / 2];
             for (Probe p : r.list) {
-                if (p.ok && p != ntpBase && Math.abs(p.offset - ntpBase.offset) > 2000) {
-                    p.ok = false;
-                    p.err = "疑似缓存时间";
-                    android.util.Log.d("MSClock", "剔除疑似缓存Date源: " + p.name);
+                if (p.ok && Math.abs(p.offset - median) > 2000) {
+                    p.unc = Math.max(p.unc * 8.0, 1000.0);
+                    android.util.Log.d("MSClock", "离群源降权(中位数基准): " + p.name);
                 }
             }
         }
@@ -540,11 +548,12 @@ public class TimeSync {
             if (why != null && why[0] == null) why[0] = "响应中无Date头";
             return null;
         }
-        if (allSame && n >= 8) {
+        if (allSame) {
             // 相位栅格跨秒采样必然出现不同 Date；全部相同说明命中了同一份缓存响应。
-            // 整体耗时已跨过 1.5s（必然跨过秒边界）时可以断定是缓存，交集虽窄也是假约束，
-            // 直接判失败；耗时不足 1.5s 时无法区分「真在同一秒内」与缓存，
-            // 只把不确定度放大到秒级最坏情况，避免缓存时间混进加权。
+            // 判定只依赖「采样是否真的跨过秒边界」(span>1.5s) 而非样本数——慢站点在
+            // 5s 预算内可能只采到 3~7 个样本，若用 n>=8 作门槛会绕过检测、
+            // 带着窄交集假收敛把缓存时间当成高精度结果。
+            // span 不足 1.5s 时无法区分「真在同一秒内」与缓存，放大 unc 到秒级最坏情况。
             long span = SystemClock.elapsedRealtime() - started;
             if (span > 1500) {
                 if (why != null) why[0] = "疑似缓存时间";
@@ -553,96 +562,152 @@ public class TimeSync {
             double mid = (low + high) / 2.0 - wallGap();
             return new double[]{mid, Math.max((high - low) / 2.0, 500.0), minRtt};
         }
-        if (high <= low) {
-            // 交集为空：取覆盖样本最多的窗口（最大共识）
-            double bestC = low, bestCnt = -1;
-            for (int i = 0; i < n; i++) {
-                double c = lo[i];
-                int cnt = 0;
-                for (int j = 0; j < n; j++) if (lo[j] <= c && c <= hi[j]) cnt++;
-                if (cnt > bestCnt) {
-                    bestCnt = cnt;
-                    bestC = c;
-                }
-            }
-            double l2 = -Double.MAX_VALUE, h2 = Double.MAX_VALUE;
-            for (int j = 0; j < n; j++) {
-                if (lo[j] <= bestC && bestC <= hi[j]) {
-                    l2 = Math.max(l2, lo[j]);
-                    h2 = Math.min(h2, hi[j]);
-                }
-            }
-            if (h2 <= l2) {
-                l2 = bestC - 50;
-                h2 = bestC + 50;
-            }
-            low = l2;
-            high = h2;
-        }
+        // 区间求交（含交集为空时的最大共识回退），逻辑在 TimeMath，可被单测覆盖
+        double[] inter = TimeMath.intersect(lo, hi, n);
         double gap = wallGap();   // 采样结束后统一换算一次；中途跳钟在此抵消
-        return new double[]{(low + high) / 2.0 - gap, (high - low) / 2.0, minRtt};
+        return new double[]{inter[0] - gap, inter[1], minRtt};
     }
 
-    /** NTP 服务器链：首选阿里云，UDP 123 被运营商拦截或单点故障时按序接力 */
+    /** NTP 服务器链：首选阿里云，其后腾讯、cn.ntp.org.cn；并行发起后按中位 offset 合成 */
     private static final String[] NTP_HOSTS = {"ntp.aliyun.com", "ntp.tencent.com", "cn.ntp.org.cn"};
 
+    /** NTP 应答质量门限（借鉴 TrueTime 的 rootDelay / rootDispersion / serverResponse 校验） */
+    private static final double NTP_ROOT_DELAY_MAX = 1000.0;      // ms
+    private static final double NTP_ROOT_DISPERSION_MAX = 1000.0; // ms
+    private static final double NTP_SERVER_RESPONSE_MAX = 2000.0; // ms（t3−t2）
+
+    /** NTP 子请求专用小线程池，避免占用校时主池导致饥饿；非 daemon 任务由 future 超时控制 */
+    private static final java.util.concurrent.ExecutorService NTP_POOL =
+            java.util.concurrent.Executors.newFixedThreadPool(3, r -> {
+                Thread t = new Thread(r, "timesync-ntp");
+                t.setDaemon(true);
+                return t;
+            });
+
     /**
-     * NTP。四时间戳公式 θ=(t2+t3)/2−(t1+t4)/2，比旧版只用 t3 少了
-     * 服务器处理时延一半的系统性偏差；校验 mode/LI/stratum 拒掉 KoD 拒答
-     * 与未同步应答。计时用单调钟 + 结束一次 gap 换算，中途跳钟不污染结果。
-     * tries<=2（快校）时首次成功即停；全量跑满取 min-RTT。
+     * DNS 解析单独隔离：InetAddress.getByName 没有超时参数，弱网下可能阻塞几十秒，
+     * 占住 NTP_POOL 后 Future.cancel 也救不回来，整轮校时就会卡住（时间源页不刷新）。
+     * 这里给解析加硬超时，并把成功结果缓存起来供后续轮次复用。
+     */
+    private static final Map<String, InetAddress> NTP_DNS_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ExecutorService DNS_POOL =
+            java.util.concurrent.Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "timesync-dns");
+                t.setDaemon(true);
+                return t;
+            });
+
+    private static InetAddress resolveNtp(String host, int timeoutMs) throws Exception {
+        InetAddress cached = NTP_DNS_CACHE.get(host);
+        if (cached != null) return cached;
+        java.util.concurrent.Future<InetAddress> f =
+                DNS_POOL.submit(() -> InetAddress.getByName(host));
+        try {
+            int dnsTimeout = Math.max(200, Math.min(timeoutMs, 1200));
+            InetAddress addr = f.get(dnsTimeout, TimeUnit.MILLISECONDS);
+            if (addr != null) NTP_DNS_CACHE.put(host, addr);
+            return addr;
+        } catch (Exception e) {
+            f.cancel(true);
+            if (cached != null) return cached;
+            throw e;
+        }
+    }
+
+    /**
+     * NTP：并行向多台服务器发一次请求，取各源 offset 的中位数（TrueTime/MuTime 思路），
+     * 消除单点服务器偏差；单源仍用四时间戳公式 θ=(t2+t3)/2−(t1+t4)/2。
+     * 校验 mode/LI/stratum/rootDelay/rootDispersion/serverResponse，拒掉 KoD、未同步与高抖动应答。
+     * 计时全用单调钟，所有源结束后统一减一次 gap 换算回 epoch，中途跳钟不污染结果。
      */
     private static double[] probeNtp(String host, int tries, int timeoutMs) {
-        double bestOff = 0, bestUnc = 0, bestRtt = Double.MAX_VALUE;
-        boolean got = false;
-        boolean stopOnFirst = tries <= 2;
-        for (int i = 0; i < tries; i++) {
-            DatagramSocket s = null;
+        int hostCount = Math.max(1, Math.min(tries, NTP_HOSTS.length));
+        java.util.List<String> hosts = new ArrayList<>(hostCount);
+        hosts.add(host);
+        for (int i = 1; i < hostCount; i++) {
+            String h = NTP_HOSTS[i % NTP_HOSTS.length];
+            if (!h.equals(host)) hosts.add(h);
+        }
+        java.util.List<java.util.concurrent.Future<double[]>> futures = new ArrayList<>(hosts.size());
+        for (String h : hosts) {
+            final String hh = h;
+            futures.add(NTP_POOL.submit(() -> ntpOnce(hh, timeoutMs)));
+        }
+        List<double[]> results = new ArrayList<>();
+        // 所有源并行、共享同一总预算：按剩余预算等待，避免第一台超时吃掉后面成功源的收集机会
+        long deadline = SystemClock.elapsedRealtime() + timeoutMs + 300;
+        for (java.util.concurrent.Future<double[]> f : futures) {
             try {
-                // 第 1 次用配置的首选源，后续按链接力
-                String h = i == 0 ? host : NTP_HOSTS[i % NTP_HOSTS.length];
-                s = new DatagramSocket();
-                s.setSoTimeout(timeoutMs);
-                byte[] buf = new byte[48];
-                buf[0] = 0x1b;
-                InetAddress addr = InetAddress.getByName(h);
-                long e1 = SystemClock.elapsedRealtime();
-                s.send(new DatagramPacket(buf, buf.length, addr, 123));
-                DatagramPacket pkt = new DatagramPacket(buf, buf.length);
-                s.receive(pkt);
-                long e4 = SystemClock.elapsedRealtime();
-                int b0 = buf[0] & 0xFF;
-                int mode = b0 & 0x07;
-                int li = (b0 >> 6) & 0x03;
-                int stratum = buf[1] & 0xFF;
-                if (mode != 4 || li == 3 || stratum == 0 || stratum > 15) continue;
-                double t2 = readNtpTs(buf, 32);   // 服务器收到请求的时刻
-                double t3 = readNtpTs(buf, 40);   // 服务器发出应答的时刻
-                if (t2 <= 0 || t3 <= 0) continue;
-                double rtt = e4 - e1;
-                double off = (t2 + t3) / 2.0 - (e1 + e4) / 2.0 - wallGap();
-                if (rtt < bestRtt) {
-                    bestRtt = rtt;
-                    bestOff = off;
-                    bestUnc = rtt / 2.0;
-                    got = true;
-                }
-                if (got && stopOnFirst) break;
-            } catch (Throwable ignored) {
-            } finally {
-                if (s != null) s.close();
+                long remain = deadline - SystemClock.elapsedRealtime();
+                if (remain <= 0) { f.cancel(true); continue; }
+                double[] m = f.get(remain, TimeUnit.MILLISECONDS);
+                if (m != null) results.add(m);
+            } catch (Exception e) {
+                f.cancel(true);
             }
         }
-        return got ? new double[]{bestOff, bestUnc, bestRtt} : null;
+        if (results.isEmpty()) return null;
+        // 每台源先按 offset 排序取中位；n 为偶数时取中间两值平均，与 TrueTime 一致
+        results.sort((a, b) -> Double.compare(a[0], b[0]));
+        double offMono;
+        double repRtt;
+        int sz = results.size();
+        if (sz % 2 == 1) {
+            offMono = results.get(sz / 2)[0];
+            repRtt = results.get(sz / 2)[1];
+        } else {
+            double[] a = results.get(sz / 2 - 1), b = results.get(sz / 2);
+            offMono = (a[0] + b[0]) / 2.0;
+            repRtt = Math.min(a[1], b[1]);
+        }
+        return new double[]{offMono - wallGap(), repRtt / 2.0, repRtt};
+    }
+
+    /** 单次 NTP 请求，返回 [serverEpoch−单调钟 中值, RTT]；质量不合格返回 null */
+    private static double[] ntpOnce(String host, int timeoutMs) {
+        DatagramSocket s = null;
+        try {
+            s = new DatagramSocket();
+            s.setSoTimeout(timeoutMs);
+            byte[] buf = new byte[48];
+            buf[0] = 0x1b;
+            InetAddress addr = resolveNtp(host, timeoutMs);
+            long e1 = SystemClock.elapsedRealtime();
+            s.send(new DatagramPacket(buf, buf.length, addr, 123));
+            DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+            s.receive(pkt);
+            long e4 = SystemClock.elapsedRealtime();
+            int b0 = buf[0] & 0xFF;
+            int mode = b0 & 0x07;
+            int li = (b0 >> 6) & 0x03;
+            int stratum = buf[1] & 0xFF;
+            if (mode != 4 || li == 3 || stratum == 0 || stratum > 15) return null;
+            double rootDelay = readNtpFixed(buf, 4);
+            double rootDispersion = readNtpFixed(buf, 8);
+            if (rootDelay > NTP_ROOT_DELAY_MAX || rootDispersion > NTP_ROOT_DISPERSION_MAX) return null;
+            double t2 = readNtpTs(buf, 32);   // 服务器收到请求的时刻
+            double t3 = readNtpTs(buf, 40);   // 服务器发出应答的时刻
+            if (t2 <= 0 || t3 <= 0 || t3 < t2 || t3 - t2 > NTP_SERVER_RESPONSE_MAX) return null;
+            double rtt = e4 - e1;
+            // 单调域先相减，gap 在 probeNtp 收集齐后统一减一次
+            double offMono = (t2 + t3) / 2.0 - (e1 + e4) / 2.0;
+            return new double[]{offMono, rtt};
+        } catch (Throwable ignored) {
+            return null;
+        } finally {
+            if (s != null) s.close();
+        }
+    }
+
+    /** 读取 NTP 32 位定点秒（16.16），换算成毫秒（复用可单测的 TimeMath） */
+    private static double readNtpFixed(byte[] buf, int off) {
+        return TimeMath.ntpFixedToMs(buf, off);
     }
 
     /** 读取 NTP 64 位时间戳（1900 起秒 + 2^-32 分数），换算成 Unix epoch 毫秒 */
     private static double readNtpTs(byte[] buf, int off) {
-        long sec = ((buf[off] & 0xFFL) << 24) | ((buf[off + 1] & 0xFFL) << 16)
-                | ((buf[off + 2] & 0xFFL) << 8) | (buf[off + 3] & 0xFFL);
-        long frac = ((buf[off + 4] & 0xFFL) << 24) | ((buf[off + 5] & 0xFFL) << 16)
-                | ((buf[off + 6] & 0xFFL) << 8) | (buf[off + 7] & 0xFFL);
-        return (sec - 2208988800L) * 1000.0 + frac / 4294967296.0 * 1000.0;
+        return TimeMath.ntpTsToMs(buf, off);
     }
 
     /**
@@ -653,28 +718,23 @@ public class TimeSync {
         List<Probe> valid = new ArrayList<>();
         for (Probe p : list) if (p.ok) valid.add(p);
         if (valid.isEmpty()) return 0;
-        double ref;
+        double[] offs = new double[valid.size()];
+        double[] uncs = new double[valid.size()];
+        double ref = 0;
         Probe ntp = null;
-        for (Probe p : valid) if ("阿里云NTP".equals(p.name)) ntp = p;
+        for (int i = 0; i < valid.size(); i++) {
+            Probe p = valid.get(i);
+            offs[i] = p.offset;
+            uncs[i] = p.unc;
+            if ("阿里云NTP".equals(p.name)) ntp = p;
+        }
         if (ntp != null) {
             ref = ntp.offset;
         } else {
-            double[] offs = new double[valid.size()];
-            for (int i = 0; i < valid.size(); i++) offs[i] = valid.get(i).offset;
-            java.util.Arrays.sort(offs);
-            ref = offs[offs.length / 2];
+            // NTP 缺席用中位数，避免单个离群源成为参考（逻辑在 TimeMath，可被单测覆盖）
+            ref = TimeMath.median(offs, offs.length);
         }
-        List<Probe> pool = new ArrayList<>();
-        for (Probe p : valid) if (Math.abs(p.offset - ref) < 350) pool.add(p);
-        if (pool.isEmpty()) pool = valid;
-        double wsum = 0, sum = 0;
-        for (Probe p : pool) {
-            double u = Math.max(p.unc, 8.0);
-            double w = 1.0 / (u * u);
-            wsum += w;
-            sum += p.offset * w;
-        }
-        return wsum > 0 ? sum / wsum : ref;
+        return TimeMath.weightedCombine(offs, uncs, ref, 350.0);
     }
 
     // ------------------------------------------------------------ 工具
