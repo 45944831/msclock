@@ -33,10 +33,6 @@ public class CmdReceiver extends BroadcastReceiver {
         } else if ("stop".equals(cmd)) {
             FloatingClockService.userClosed = true;
             c.stopService(new Intent(c, FloatingClockService.class));
-        } else if ("diagtest".equals(cmd)) {
-            // 诊断自测：只写 logcat，不改 UI 状态、不碰校时结果。
-            // 真机无 root 制造不了 DNS 失败时，用它验证诊断三态判定链路。
-            FloatingClockService.diagSelfTest();
         }
     }
 }

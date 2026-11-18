@@ -69,7 +69,7 @@ echo "   编译通过，class 文件数: $(find "$OUT/classes" -name '*.class' |
 
 echo "==> 4/6 转 dex"
 find "$OUT/classes" -name "*.class" > "$OUT/classes.txt"
-for c in MainActivity FloatingClockService ClockView TimeSync TimeMath DnsProbe UiKit CmdReceiver; do
+for c in MainActivity FloatingClockService ClockView TimeSync TimeMath UiKit CmdReceiver; do
     if [ ! -f "$OUT/classes/com/wb/msclock/$c.class" ]; then
         echo "!!! 缺少类文件: $c.class —— 构建中止 !!!"
         exit 1
