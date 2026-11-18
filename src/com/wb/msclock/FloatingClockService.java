@@ -481,6 +481,39 @@ public class FloatingClockService extends Service {
         }
     }
 
+    /**
+     * 诊断自测钩子（仅 adb 可触发，CmdReceiver 受 DUMP 权限保护）。
+     * 在后台线程对「真实域名」和「不存在域名」各跑一次完整诊断，结果只写 logcat：
+     * 真实域名应判 NONE（本机解析正常），不存在域名若本机也失败应判 REMOTE_MISS。
+     * 不修改 lastResult / lastStatus / 校时状态，纯只读验证，不影响悬浮窗。
+     */
+    public static void diagSelfTest() {
+        Thread t = new Thread(() -> {
+            android.util.Log.d("MSClock", "=== DNS 诊断自测开始 ===");
+            String[] domains = {"h5api.m.taobao.com", "www.baidu.com",
+                    "nonexistent-xyz-987654.invalid"};
+            for (String d : domains) {
+                try {
+                    DnsProbe.Diagnosis r = DnsProbe.run(d, 700);
+                    String label = r.verdict == DnsProbe.LOCAL_DNS ? "本机DNS/hosts异常"
+                            : r.verdict == DnsProbe.REMOTE_MISS ? "公网无记录" : "无结论(不干预)";
+                    // 真机难以制造「本机解析失败」，额外展示该权威状态下
+                    // 若本机失败会判成什么，覆盖 LOCAL_DNS 分支的验证
+                    int whatIfLocalFail = DnsProbe.judge(false, r.remoteState);
+                    android.util.Log.d("MSClock", "DIAGTEST " + d
+                            + " | 本机=" + r.localOk + " 权威=" + r.remoteState
+                            + " | 结论=" + label + " | 文案=" + r.text
+                            + " | 若本机失败→" + DnsProbe.textOf(whatIfLocalFail));
+                } catch (Throwable e) {
+                    android.util.Log.w("MSClock", "DIAGTEST " + d + " 异常: " + e);
+                }
+            }
+            android.util.Log.d("MSClock", "=== DNS 诊断自测结束 ===");
+        }, "diagtest");
+        t.setDaemon(true);
+        t.start();
+    }
+
     /** 展示名反查 key（domainOf 接受 key）；找不到时返回 null 让调用方跳过该源 */
     private static String sourceKeyOfName(String name) {
         if (name == null) return null;
