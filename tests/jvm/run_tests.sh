@@ -6,8 +6,10 @@ SRC="../../src/com/wb/msclock/TimeMath.java"
 OUT="classes"
 rm -rf "$OUT" && mkdir -p "$OUT"
 
-echo "==> 编译 TimeMath + 测试"
-javac -encoding UTF-8 -d "$OUT" "$SRC" TimeMathTest.java
+echo "==> 编译 TimeMath + DnsProbe + 测试"
+javac -encoding UTF-8 -d "$OUT" "$SRC" ../../src/com/wb/msclock/DnsProbe.java \
+    TimeMathTest.java DnsProbeTest.java
 
 echo "==> 运行测试"
 java -cp "$OUT" TimeMathTest
+java -cp "$OUT" DnsProbeTest

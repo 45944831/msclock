@@ -399,6 +399,12 @@ public class FloatingClockService extends Service {
             } catch (Throwable t) {
                 r = null;
             }
+            // DNS 失败旁路诊断：仅当本轮因域名解析失败时，直连公共 DNS 区分
+            // 「本机 DNS/hosts 异常」与「域名/出口问题」。成功路径绝不进入，零开销。
+            // 只在代次仍有效时做，避免被看门狗取消的旧轮次白跑网络请求。
+            if (r != null && !r.ok && r.failKind == TimeSync.FAIL_DNS && gen == syncGen) {
+                diagnoseDnsFailure(r);
+            }
             android.util.Log.d("MSClock", "startSync" + (full ? "全量" : "快") + " 完成 "
                     + (SystemClock.elapsedRealtime() - tSubmit) + "ms");
             boolean current = (gen == syncGen);
@@ -436,6 +442,52 @@ public class FloatingClockService extends Service {
             syncVersion++;              // 结果已就绪：界面立刻重取，不等 1s 轮询
             if (again) startSync(true);
         });
+    }
+
+    /**
+     * DNS 失败后的交叉诊断旁路。选一个本轮解析失败的源域名，一边用本机解析器
+     * （含 hosts），一边直连公共 DNS IP，判定故障在哪一侧。
+     *
+     * 保守原则：
+     *  - 只有拿到明确结论才改文案；无结论时保留 v1.4 的「域名解析失败 · 检查 DNS/VPN」。
+     *  - 每一步都有硬超时，且只在失败路径执行，成功校时不会为此多花一毫秒。
+     *  - 诊断失败/异常一律吞掉，绝不能让旁路把一次失败变成崩溃。
+     */
+    private static void diagnoseDnsFailure(TimeSync.Result r) {
+        String domain = null;
+        for (TimeSync.Probe p : r.list) {
+            if (p == null || p.ok || p.optional) continue;
+            String e = p.err == null ? "" : p.err;
+            if (e.contains("解析")) {
+                String d = TimeSync.domainOf(sourceKeyOfName(p.name));
+                if (d != null && !d.isEmpty() && !d.contains(" ")) { domain = d; break; }
+            }
+        }
+        if (domain == null) return;
+        try {
+            DnsProbe.Diagnosis d = DnsProbe.run(domain, 700);
+            android.util.Log.d("MSClock", "DNS交叉诊断 " + domain
+                    + " 本机=" + d.localOk + " 权威=" + d.remoteState + " 结论=" + d.verdict);
+            if (d.verdict == DnsProbe.LOCAL_DNS) {
+                r.failKind = TimeSync.FAIL_LOCAL_DNS;
+                r.text = d.text;
+            } else if (d.verdict == DnsProbe.REMOTE_MISS) {
+                r.failKind = TimeSync.FAIL_REMOTE_MISS;
+                r.text = d.text;
+            }
+            // NONE：保留原分级文案，不动 r
+        } catch (Throwable t) {
+            android.util.Log.w("MSClock", "DNS交叉诊断异常，保留原文案: " + t);
+        }
+    }
+
+    /** 展示名反查 key（domainOf 接受 key）；找不到时返回 null 让调用方跳过该源 */
+    private static String sourceKeyOfName(String name) {
+        if (name == null) return null;
+        for (int i = 0; i < TimeSync.NAMES.length; i++) {
+            if (TimeSync.NAMES[i].equals(name)) return TimeSync.KEYS[i];
+        }
+        return null;
     }
 
     private WindowManager wm;

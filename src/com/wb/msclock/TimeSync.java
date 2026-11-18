@@ -69,9 +69,12 @@ public class TimeSync {
     public static final int FAIL_NONE = 0;
     public static final int FAIL_NO_NETWORK = 1;   // 无活动网络 / 未通过 VALIDATED
     public static final int FAIL_TIMEOUT = 2;      // 有网但全部超时
-    public static final int FAIL_DNS = 3;          // 多数域名解析失败
+    public static final int FAIL_DNS = 3;          // 多数域名解析失败（交叉诊断前的原始判定）
     public static final int FAIL_SSL = 4;          // 多数 SSL 握手失败
     public static final int FAIL_OTHER = 5;
+    // 以下两项由 Service 失败旁路诊断覆盖：DNS 失败时用直连公共 DNS 区分本机与外部故障
+    public static final int FAIL_LOCAL_DNS = 6;    // 公网可解析、本机解析失败 → 本机 DNS/hosts 异常
+    public static final int FAIL_REMOTE_MISS = 7;  // 公网权威也无记录 → 域名本身无解析
 
     public static class Result {
         public List<Probe> list = new ArrayList<>();
