@@ -45,6 +45,9 @@ jobs:
         run: bash build_apk.sh
       - name: 校验产物
         run: |
+          # build_apk.sh 固定把产物写到脚本目录的上一级（本地开发时是工作区根）。
+          # CI 中脚本就在仓库根，上一级落在仓库外，需先复制回仓库内才能校验和上传。
+          cp -f "../毫秒悬浮时钟.apk" "./毫秒悬浮时钟.apk"
           test -f "毫秒悬浮时钟.apk"
           echo "APK 大小: $(stat -c%s '毫秒悬浮时钟.apk') bytes"
       - uses: actions/upload-artifact@v4
