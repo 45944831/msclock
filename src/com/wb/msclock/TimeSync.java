@@ -77,6 +77,9 @@ public class TimeSync {
         public List<Probe> list = new ArrayList<>();
         public double offset;   // 综合 offset，ms
         public boolean ok;
+        /** 是否有非可选（网络）源成功。可选系统源(sysnet/gnss)用本地缓存时间，
+         *  断网时也可能 ok=true，但那不代表"网络校时成功"，UI 展示与失败弹窗须用此字段。 */
+        public boolean networkOk;
         public boolean full;    // true=全量，false=快校时 3 源
         public int total = 3;   // 本轮参与统计的源数（单源合并后会增长）
         public int okCount;
@@ -103,60 +106,17 @@ public class TimeSync {
     }
 
     // ------------------------------------------------------------ 各源定义
-    // 注意：KEYS/NAMES/COLORS/KINDS/URLS/DOMAINS 六个数组必须按下标严格对齐
-    //（device 占 0 位，KINDS[0]="none"、URLS[0]=null，不联网）
-    public static final String[] KEYS = {
-            "device", "taobao", "tmall", "jd", "meituan", "eleme",
-            "vip", "pdd", "bili", "kuaishou", "xhs", "alipay", "rail", "unionpay",
-            "ntp", "gnss", "sysnet"
-    };
-    public static final String[] NAMES = {
-            "设备时间", "淘宝", "天猫", "京东", "美团", "饿了么",
-            "唯品会", "拼多多", "哔哩哔哩", "快手", "小红书", "支付宝", "12306", "云闪付",
-            "阿里云NTP", "GNSS授时", "系统网络时间"
-    };
-    public static final String[] COLORS = {
-            "#8A93A6", "#FF6A00", "#FF0036", "#E8443A", "#FFC300", "#1E90FF",
-            "#F10180", "#E02E24", "#00A1D6", "#FF8800", "#FF2442", "#1677FF", "#1A5CC8", "#005BAC",
-            "#3DDC84", "#1E8E3E", "#7C4DFF"
-    };
-    private static final String[] KINDS = {
-            "none", "ms", "ms", "date", "date", "date",
-            "date", "date", "date", "date", "date", "date", "date", "date",
-            "ntp", "gnss", "sysnet"
-    };
-    private static final String[] URLS = {
-            null,
-            "https://h5api.m.taobao.com/h5/mtop.common.getTimestamp/1.0/?jsv=2.5.1&appKey=12574478&t=%d&sign=1",
-            "https://h5api.m.tmall.com/h5/mtop.common.getTimestamp/1.0/?jsv=2.5.1&appKey=12574478&t=%d&sign=1",
-            "https://api.m.jd.com/api?appid=publicUseApi",
-            "https://www.meituan.com/",
-            "https://www.ele.me/",
-            "https://www.vip.com/",
-            "https://mobile.yangkeduo.com/",
-            "https://www.bilibili.com/",
-            "https://www.kuaishou.com/",
-            "https://www.xiaohongshu.com/",
-            "https://my.alipay.com/",
-            "https://www.12306.cn/index/",
-            "https://www.unionpayintl.com/",
-            "ntp.aliyun.com",
-            null,   // gnss：走 SystemClock.currentGnssTimeClock()，无 URL
-            null    // sysnet：走 SystemClock.currentNetworkTimeClock()，无 URL
-    };
-    /** 各源展示用的域名 */
-    public static final String[] DOMAINS = {
-            "设备系统时钟", "h5api.m.taobao.com", "h5api.m.tmall.com",
-            "api.m.jd.com", "www.meituan.com", "www.ele.me",
-            "www.vip.com", "mobile.yangkeduo.com", "www.bilibili.com",
-            "www.kuaishou.com", "www.xiaohongshu.com", "my.alipay.com", "www.12306.cn", "www.unionpayintl.com",
-            "ntp.aliyun.com", "系统 GNSS 时钟", "系统网络时间"
-    };
+    // 单一数据源在 Sources.ALL；六数组由它派生，新增源只需改 Sources 一处。
+    public static final String[] KEYS = Sources.KEYS;
+    public static final String[] NAMES = Sources.NAMES;
+    public static final String[] COLORS = Sources.COLORS;
+    private static final String[] KINDS = Sources.KINDS;
+    private static final String[] URLS = Sources.URLS;
+    public static final String[] DOMAINS = Sources.DOMAINS;
 
     /** 可选源：失败不计入总数、不触发失败判定（室内无 GNSS 信号属正常） */
     private static boolean isOptionalKind(int i) {
-        String k = KINDS[i];
-        return "gnss".equals(k) || "sysnet".equals(k);
+        return Sources.ALL[i].optional();
     }
 
     /** 源下标；-1 表示未知 key */
@@ -468,12 +428,14 @@ public class TimeSync {
             }
         }
         int okCount = 0, optFail = 0;
+        int networkOkCount = 0;
         int nTimeout = 0, nDns = 0, nSsl = 0;
         StringBuilder dbg = new StringBuilder();
         StringBuilder fail = new StringBuilder();
         for (Probe p : r.list) {
             if (p.ok) {
                 okCount++;
+                if (!p.optional) networkOkCount++;
                 dbg.append(p.name).append(String.format(" %+.0f±%.0fms; ", p.offset, p.unc));
             } else {
                 String e = p.err == null ? "失败" : p.err;
@@ -496,6 +458,7 @@ public class TimeSync {
         }
         if (optFail > 0) r.total = Math.max(1, r.total - optFail);
         r.okCount = okCount;
+        r.networkOk = networkOkCount > 0;   // 等价于 TimeMath.hasNetworkSuccess(ok[], optional[])
         r.ok = okCount > 0;
         // 全量总是刷新明细；快校成功时也刷新，避免上一轮全量失败的红字在恢复后残留
         if (full || r.ok) lastFailText = fail.toString().trim();
@@ -524,8 +487,16 @@ public class TimeSync {
         int total = r.total > 0 ? r.total : (full ? KEYS.length - 1 : FAST_SOURCES);
         // NTP 失败时用综合值兜底，避免快校只显示"已同步 2/3 源"却没有偏差
         double ref = ntp != null ? ntp.offset : r.offset;
-        r.text = String.format("已同步 %d/%d 源 · 本机%s %.0fms",
-                okCount, total, ref >= 0 ? "慢" : "快", Math.abs(ref));
+        if (r.networkOk) {
+            r.text = String.format("已同步 %d/%d 源 · 本机%s %.0fms",
+                    okCount, total, ref >= 0 ? "慢" : "快", Math.abs(ref));
+        } else {
+            // 仅靠系统缓存时间(sysnet/gnss)成功：时间可用但未真正联网校时，
+            // 必须明确告知用户，不能显示"已同步 X 源"造成误导。
+            r.text = String.format("网络不可用 · 仅用系统缓存时间（本机%s %.0fms）",
+                    ref >= 0 ? "慢" : "快", Math.abs(ref));
+            r.failKind = FAIL_NO_NETWORK;
+        }
     }
 
     private static Probe failed(int i, String err) {
@@ -533,6 +504,8 @@ public class TimeSync {
         p.name = NAMES[i];
         p.color = COLORS[i];
         p.ok = false;
+        // 与 probeOneRaw 保持一致：可选源(GNSS/sysnet)失败不进失败明细、不计入总数
+        p.optional = isOptionalKind(i);
         p.err = err;
         return p;
     }
@@ -776,28 +749,40 @@ public class TimeSync {
      * 占住 NTP_POOL 后 Future.cancel 也救不回来，整轮校时就会卡住（时间源页不刷新）。
      * 这里给解析加硬超时，并把成功结果缓存起来供后续轮次复用。
      */
-    private static final Map<String, InetAddress> NTP_DNS_CACHE =
+    /** DNS 缓存条目：带单调钟时间戳，TTL 到期后重解析，避免网络切换/CDN 变更后永久指向旧 IP */
+    private static final class DnsEntry {
+        final InetAddress addr;
+        final long atMillis;
+        DnsEntry(InetAddress a, long t) { addr = a; atMillis = t; }
+    }
+    private static final long DNS_TTL_MS = 10 * 60 * 1000L;   // 10 分钟
+    private static final Map<String, DnsEntry> NTP_DNS_CACHE =
             new java.util.concurrent.ConcurrentHashMap<>();
+    /** 有界池：最多 3 个解析任务（NTP 服务器就是 3 台），防止弱网下无限堆积解析线程 */
     private static final java.util.concurrent.ExecutorService DNS_POOL =
-            java.util.concurrent.Executors.newCachedThreadPool(r -> {
-                Thread t = new Thread(r, "timesync-dns");
-                t.setDaemon(true);
-                return t;
-            });
+            new ThreadPoolExecutor(0, 3, 30, TimeUnit.SECONDS,
+                    new LinkedBlockingQueue<>(),
+                    r -> {
+                        Thread t = new Thread(r, "timesync-dns");
+                        t.setDaemon(true);
+                        return t;
+                    });
 
     private static InetAddress resolveNtp(String host, int timeoutMs) throws Exception {
-        InetAddress cached = NTP_DNS_CACHE.get(host);
-        if (cached != null) return cached;
+        DnsEntry cached = NTP_DNS_CACHE.get(host);
+        long now = SystemClock.elapsedRealtime();
+        // 缓存有效：直接复用。过期/不存在：重解析（失败时仍回退旧地址，保证可用性）
+        if (cached != null && now - cached.atMillis < DNS_TTL_MS) return cached.addr;
         java.util.concurrent.Future<InetAddress> f =
                 DNS_POOL.submit(() -> InetAddress.getByName(host));
         try {
             int dnsTimeout = Math.max(200, Math.min(timeoutMs, 1200));
             InetAddress addr = f.get(dnsTimeout, TimeUnit.MILLISECONDS);
-            if (addr != null) NTP_DNS_CACHE.put(host, addr);
+            if (addr != null) NTP_DNS_CACHE.put(host, new DnsEntry(addr, SystemClock.elapsedRealtime()));
             return addr;
         } catch (Exception e) {
             f.cancel(true);
-            if (cached != null) return cached;
+            if (cached != null) return cached.addr;
             throw e;
         }
     }
@@ -968,10 +953,14 @@ public class TimeSync {
     }
 
     private static double wallGap() {
+        // 墙钟与单调钟成对采样：正常时取两对中点消除残余偏差；
+        // 若采样间隙发生跳钟（w2−w1>5ms），只用跳变后的一对，避免用跳变前的 e 污染 gap
         long w1 = System.currentTimeMillis();
-        long e = SystemClock.elapsedRealtime();
+        long e1 = SystemClock.elapsedRealtime();
         long w2 = System.currentTimeMillis();
-        return (Math.abs(w2 - w1) <= 5 ? (w1 + w2) / 2.0 : w2) - e;
+        long e2 = SystemClock.elapsedRealtime();
+        if (Math.abs(w2 - w1) > 5) return w2 - e2;
+        return (w1 + w2) / 2.0 - (e1 + e2) / 2.0;
     }
 
     private static HttpURLConnection open(String url, String ua) throws Exception {
@@ -991,13 +980,20 @@ public class TimeSync {
         return c;
     }
 
+    /** 响应体读取上限：异常端点可能在 3s 内推送超大响应占满内存，256KB 足够时间戳接口 */
+    private static final int MAX_BODY_BYTES = 256 * 1024;
+
     private static String readAll(HttpURLConnection c) {
         try {
             InputStream in = c.getInputStream();
             ByteArrayOutputStream bo = new ByteArrayOutputStream();
             byte[] b = new byte[2048];
-            int len;
-            while ((len = in.read(b)) > 0) bo.write(b, 0, len);
+            int len, total = 0;
+            while ((len = in.read(b)) > 0) {
+                bo.write(b, 0, len);
+                total += len;
+                if (total >= MAX_BODY_BYTES) break;
+            }
             in.close();
             return new String(bo.toByteArray(), "UTF-8");
         } catch (Throwable t) {

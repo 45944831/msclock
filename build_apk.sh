@@ -69,7 +69,10 @@ echo "   编译通过，class 文件数: $(find "$OUT/classes" -name '*.class' |
 
 echo "==> 4/6 转 dex"
 find "$OUT/classes" -name "*.class" > "$OUT/classes.txt"
-for c in MainActivity FloatingClockService ClockView TimeSync TimeMath UiKit CmdReceiver; do
+# 必需类清单从 src 实际源文件自动派生，避免新增/重命名类时忘记同步写死列表
+#（曾经因为写死列表漏掉 DnsProbe 导致构建中止）
+for src_file in src/com/wb/msclock/*.java; do
+    c=$(basename "$src_file" .java)
     if [ ! -f "$OUT/classes/com/wb/msclock/$c.class" ]; then
         echo "!!! 缺少类文件: $c.class —— 构建中止 !!!"
         exit 1
@@ -99,15 +102,18 @@ PY
 "$ZIPALIGN" -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 
 echo "==> 6/6 签名"
-KS="debug.keystore"   # 持久化密钥库，避免每次构建换签名导致无法覆盖安装
+KS="${KS:-debug.keystore}"              # 持久化密钥库，避免每次构建换签名导致无法覆盖安装
+KS_ALIAS="${KS_ALIAS:-clock}"
+KS_PASS="${KS_PASS:-android}"           # 正式分发：用环境变量 KS/KS_ALIAS/KS_PASS 注入，口令不入库
 if [ ! -f "$KS" ]; then
-    "${JAVA_BIN}keytool" -genkeypair -v -keystore "$KS" -alias clock \
+    "${JAVA_BIN}keytool" -genkeypair -v -keystore "$KS" -alias "$KS_ALIAS" \
         -keyalg RSA -keysize 2048 -validity 10000 \
-        -storepass android -keypass android \
+        -storepass "$KS_PASS" -keypass "$KS_PASS" \
         -dname "CN=MsClock, OU=WB, O=WB, L=Beijing, C=CN" >/dev/null 2>&1
 fi
 "${JAVA_BIN}java" -jar "$BT/lib/apksigner.jar" sign \
-    --ks "$KS" --ks-pass pass:android --key-pass pass:android \
+    --ks "$KS" --ks-key-alias "$KS_ALIAS" \
+    --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
     --out "../$APK_NAME" "$OUT/aligned.apk"
 
 "${JAVA_BIN}java" -jar "$BT/lib/apksigner.jar" verify "../$APK_NAME" && echo "签名校验通过"

@@ -38,11 +38,15 @@ public class MainActivity extends Activity {
     private static final int SEL_BG = 0xFFEDF3FF;
     private static final int GREEN = 0xFF12A150;
 
-    private static final String[] ALL_KEYS = {
-            "auto", "device", "taobao", "tmall", "jd", "meituan", "eleme",
-            "vip", "pdd", "bili", "kuaishou", "xhs", "alipay", "rail", "unionpay",
-            "ntp", "gnss", "sysnet"
-    };
+    // auto 为合成项，其余全部来自 Sources 单一数据源，不再复制维护
+    private static final String[] ALL_KEYS = buildAllKeys();
+
+    private static String[] buildAllKeys() {
+        String[] keys = new String[Sources.ALL.length + 1];
+        keys[0] = "auto";
+        System.arraycopy(Sources.KEYS, 0, keys, 1, Sources.KEYS.length);
+        return keys;
+    }
 
     private static final int SCREEN_MAIN = 0;
     private static final int SCREEN_SOURCES = 1;
@@ -167,6 +171,7 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    @SuppressWarnings("deprecation") // 项目不依赖 AndroidX；targetSdk 33 未启用预测式返回，onBackPressed 仍为有效回调
     public void onBackPressed() {
         if (currentScreen != SCREEN_MAIN) {
             showMain();
@@ -676,7 +681,8 @@ public class MainActivity extends Activity {
         TimeSync.Result r = FloatingClockService.lastResult;
         boolean synced = (r != null && r.ok);
 
-        long bt = devNow + (long) FloatingClockService.appliedOffsetMs;
+        // 与悬浮窗共用同一走时基准（含频偏补偿），避免长时间运行后两处显示分叉
+        long bt = FloatingClockService.wallNow();
         String mt = fmt(bt, 1);
         if (!mt.equals(lastMainTime)) {
             lastMainTime = mt;
@@ -706,7 +712,9 @@ public class MainActivity extends Activity {
     private void updateValues() {
         TimeSync.Result r = FloatingClockService.lastResult;
         String sel = FloatingClockService.source;
-        boolean synced = (r != null && r.ok);
+        // UI「已同步」与失败弹窗只认网络源成功：断网时 sysnet/gnss 用系统缓存时间
+        // 仍可能 r.ok=true，但那不是网络校时成功，不能显示「已同步」而不提示用户。
+        boolean synced = (r != null && r.networkOk);
 
         updateClockTexts();
 
@@ -823,7 +831,8 @@ public class MainActivity extends Activity {
         }
 
         // 正常→失败跃变时弹窗告知原因；后台重校成功则自动关闭
-        boolean okNow = (r != null && r.ok);
+        // 用 networkOk：断网时系统缓存时间源成功不代表校时成功，应提示用户
+        boolean okNow = (r != null && r.networkOk);
         if (!syncing && !okNow && r != null && lastOkState) {
             lastOkState = false;
             String msg = r.text + (ft == null || ft.isEmpty() ? "" : "\n\n" + ft);

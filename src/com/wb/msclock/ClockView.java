@@ -145,17 +145,11 @@ public class ClockView extends View {
         if (showMillis) c.drawText(ms, 0, 4, x + wTime + gap, y, pMs);
     }
 
-    /** 把本地时:分:秒写入复用缓冲，每秒仅执行一次 */
+    /** 把本地时:分:秒写入复用缓冲，每秒仅执行一次；格式化统一委托可单测的 TimeMath */
     private void fillHms(long epochSec) {
-        long local = epochSec + TimeZone.getDefault().getOffset(epochSec * 1000L) / 1000L;
-        int s = (int) Math.floorMod(local, 86400L);
-        int hh = s / 3600, mm = (s % 3600) / 60, ss = s % 60;
-        hms[0] = (char) ('0' + hh / 10);
-        hms[1] = (char) ('0' + hh % 10);
-        hms[3] = (char) ('0' + mm / 10);
-        hms[4] = (char) ('0' + mm % 10);
-        hms[6] = (char) ('0' + ss / 10);
-        hms[7] = (char) ('0' + ss % 10);
+        long epochMs = epochSec * 1000L;
+        int tzOffsetSec = TimeZone.getDefault().getOffset(epochMs) / 1000;
+        TimeMath.writeClock(hms, 0, epochMs, false, tzOffsetSec);
     }
 
     public void setAccent(int color) {

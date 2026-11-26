@@ -151,7 +151,8 @@ public class FloatingClockService extends Service {
             // 缓存值来自上次进程，精度不可考：给较大的 unc，让首次实测以较高权重接管
             appliedUnc = cachedValid ? 80 : 0;
             usingCachedOffset = cachedValid;
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logPersistFailure("loadPrefs", t);
         }
     }
 
@@ -159,11 +160,17 @@ public class FloatingClockService extends Service {
         return Math.max(lo, Math.min(hi, v));
     }
 
+    /** 持久化失败不能静默：至少留下日志，否则设置/缓存丢失无从排查 */
+    private static void logPersistFailure(String what, Throwable t) {
+        android.util.Log.w("MSClock", "保存失败: " + what, t);
+    }
+
     public static void saveAppearance(Context c) {
         try {
             prefs(c).edit()
                     .putFloat("scale", scale).putFloat("alpha", alpha).apply();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logPersistFailure("appearance", t);
         }
     }
 
@@ -186,7 +193,8 @@ public class FloatingClockService extends Service {
         fps = value == 30 ? 30 : 60;
         try {
             prefs(c).edit().putInt("fps", fps).apply();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logPersistFailure("fps", t);
         }
         FloatingClockService inst = instance;
         if (inst != null) inst.ui.post(inst::applyFps);
@@ -197,7 +205,8 @@ public class FloatingClockService extends Service {
         showMillis = show;
         try {
             prefs(c).edit().putBoolean("showMillis", show).apply();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logPersistFailure("showMillis", t);
         }
         FloatingClockService inst = instance;
         if (inst != null) inst.ui.post(inst::applyRenderMode);
@@ -256,7 +265,8 @@ public class FloatingClockService extends Service {
         source = TimeSync.hasKey(key) ? key : "auto";
         try {
             prefs(c).edit().putString("source", source).apply();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logPersistFailure("source", t);
         }
         FloatingClockService inst = instance;
         if (lastResult != null && lastResult.ok) {
@@ -298,7 +308,8 @@ public class FloatingClockService extends Service {
         manualMs = (int) clamp(ms, -5000, 5000);
         try {
             prefs(c).edit().putInt("manual", manualMs).apply();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logPersistFailure("manual", t);
         }
         FloatingClockService inst = instance;
         double base = (lastResult != null && lastResult.ok)
@@ -448,12 +459,13 @@ public class FloatingClockService extends Service {
     private long frameIntervalNs = 1_000_000_000L / 60;
     private long lastFrameNs;
 
-    private double baseServerMs;
-    private long baseElapsed;
+    /**
+     * 统一走时基准：悬浮窗与 MainActivity 共用同一实例，保证两处显示完全一致。
+     * 纯 JVM 类 TimeBase 承载锚点与频偏，可被单测直接覆盖。
+     */
+    public static final TimeBase TIME_BASE = new TimeBase();
     /** 当前基准的不确定度（ms）；≤0 表示无历史，融合时直接采纳新值。静态以匹配 appliedOffsetMs */
     private static volatile double appliedUnc;
-    /** 频率偏差（ppm）：由历史校时结果拟合，用于两次校时之间的走时补偿 */
-    private volatile double driftPpm;
 
     /** drift 拟合样本环形缓冲（最多 8 条） */
     private static final int DRIFT_CAP = 8;
@@ -564,8 +576,7 @@ public class FloatingClockService extends Service {
     public void onCreate() {
         super.onCreate();
         loadPrefs(this);
-        baseServerMs = System.currentTimeMillis();
-        baseElapsed = SystemClock.elapsedRealtime();
+        TIME_BASE.reset();
         applyRestoredOffset();
 
         if (!Settings.canDrawOverlays(this)) {
@@ -591,9 +602,8 @@ public class FloatingClockService extends Service {
         view = new ClockView(this);
         view.setSource(this::currentWallMs);
 
-        int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                : WindowManager.LayoutParams.TYPE_PHONE;
+        // minSdk 26(O) 起 TYPE_APPLICATION_OVERLAY 可用；TYPE_PHONE 分支永不可达，已移除
+        int type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
 
         lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -731,7 +741,12 @@ public class FloatingClockService extends Service {
             IntentFilter f = new IntentFilter();
             f.addAction(Intent.ACTION_SCREEN_OFF);
             f.addAction(Intent.ACTION_SCREEN_ON);
-            registerReceiver(screenReceiver, f);
+            // Android 13+ 要求显式声明导出标志；本接收器只收系统广播，不对外开放
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(screenReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(screenReceiver, f);
+            }
         } catch (Throwable ignored) {
         }
     }
@@ -951,7 +966,8 @@ public class FloatingClockService extends Service {
         posY = lp.y;
         try {
             prefs(this).edit().putInt("posX", posX).putInt("posY", posY).apply();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logPersistFailure("position", t);
         }
     }
 
@@ -963,15 +979,16 @@ public class FloatingClockService extends Service {
                     .putLong("syncWall", System.currentTimeMillis())
                     .putLong("syncElapsed", SystemClock.elapsedRealtime())
                     .apply();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logPersistFailure("syncCache", t);
         }
     }
 
     /** 启动时用上次偏移顶着走，避免网络校时完成前显示未校正的设备时间 */
     private void applyRestoredOffset() {
         double total = (cachedValid ? cachedOffsetMs : 0) + manualMs;
-        baseServerMs = System.currentTimeMillis() + total;
-        baseElapsed = SystemClock.elapsedRealtime();
+        TIME_BASE.anchor(System.currentTimeMillis() + total,
+                SystemClock.elapsedRealtime(), TIME_BASE.getDriftPpm());
         appliedOffsetMs = total;
         usingCachedOffset = cachedValid;
         if (view != null) {
@@ -1001,8 +1018,15 @@ public class FloatingClockService extends Service {
      * 频偏项让"熄屏数小时/弱网长时间无法校时"后的累积误差降低一个量级。
      */
     private long currentWallMs() {
-        long dt = SystemClock.elapsedRealtime() - baseElapsed;
-        return (long) (baseServerMs + dt * (1.0 + driftPpm * 1e-6));
+        return (long) TIME_BASE.at(SystemClock.elapsedRealtime(), System.currentTimeMillis());
+    }
+
+    /** 供 MainActivity 取同一走时基准；服务未锚定时回退到 墙钟+偏移，保证界面始终有值 */
+    public static long wallNow() {
+        if (TIME_BASE.isAnchored()) {
+            return (long) TIME_BASE.at(SystemClock.elapsedRealtime(), System.currentTimeMillis());
+        }
+        return System.currentTimeMillis() + (long) appliedOffsetMs;
     }
 
     /** 本次测量结果的不确定度：综合值取参与源的中位 unc 折半，单源取其自身 unc */
@@ -1052,24 +1076,26 @@ public class FloatingClockService extends Service {
         double[] fit = TimeMath.fitDrift(ts, os, us, driftN);
         if (fit == null) return;
         if (Math.abs(fit[0]) > 100 || fit[1] > 15) {
-            driftPpm = 0;      // 噪声主导或测量跳变，放弃补偿
+            TIME_BASE.setDriftPpm(0);      // 噪声主导或测量跳变，放弃补偿
             android.util.Log.d("MSClock", String.format(
                     "drift 弃用: %.1fppm 残差%.1fms (样本%d)", fit[0], fit[1], driftN));
             return;
         }
-        double old = driftPpm;
-        driftPpm = old * 0.7 + fit[0] * 0.3;   // 平滑更新，避免抖动
+        double old = TIME_BASE.getDriftPpm();
+        double next = old * 0.7 + fit[0] * 0.3;   // 平滑更新，避免抖动
+        TIME_BASE.setDriftPpm(next);
         android.util.Log.d("MSClock", String.format(
-                "drift 更新: %.1fppm 残差%.1fms (样本%d)", driftPpm, fit[1], driftN));
+                "drift 更新: %.1fppm 残差%.1fms (样本%d)", next, fit[1], driftN));
         // 频偏改变会让走时斜率突变：dt 越大跳得越狠（10 分钟 × 5ppm ≈ 3ms）。
         // 变化超过 2ppm 时用旧斜率算出当前时刻并重锚，保证显示连续。
-        if (Math.abs(driftPpm - old) > 2.0) {
+        if (Math.abs(next - old) > 2.0) {
             final double od = old;
             ui.post(() -> {
-                long now = (long) (baseServerMs
-                        + (SystemClock.elapsedRealtime() - baseElapsed) * (1.0 + od * 1e-6));
-                baseServerMs = now;
-                baseElapsed = SystemClock.elapsedRealtime();
+                long e = SystemClock.elapsedRealtime();
+                double now = TIME_BASE.atWithDrift(e, od);
+                if (!Double.isNaN(now)) {
+                    TIME_BASE.anchor(now, e, TIME_BASE.getDriftPpm());
+                }
             });
         }
     }
@@ -1105,8 +1131,8 @@ public class FloatingClockService extends Service {
             if (!force && !usingCachedOffset && Math.abs(total - appliedOffsetMs) < 3) {
                 return;
             }
-            baseServerMs = System.currentTimeMillis() + total;
-            baseElapsed = SystemClock.elapsedRealtime();
+            TIME_BASE.anchor(System.currentTimeMillis() + total,
+                    SystemClock.elapsedRealtime(), TIME_BASE.getDriftPpm());
             appliedOffsetMs = total;
             appliedUnc = unc;
             usingCachedOffset = false;

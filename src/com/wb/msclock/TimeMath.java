@@ -167,13 +167,28 @@ public final class TimeMath {
         return new double[]{(l2 + h2) / 2.0, (h2 - l2) / 2.0};
     }
 
-    /** NTP 64 位时间戳（1900 起秒 + 2^-32 分数）→ Unix epoch 毫秒 */
+    /** NTP 32 位秒在 2036-02-07 翻绕到 era 1；半个 era（2^31 秒）用于判定并纠正时代 */
+    private static final double NTP_HALF_ERA_MS = 2147483648.0 * 1000.0;
+
+    /** NTP 64 位时间戳（1900 起秒 + 2^-32 分数）→ Unix epoch 毫秒，以当前时刻消除 era 歧义 */
     public static double ntpTsToMs(byte[] buf, int off) {
+        return ntpTsToMs(buf, off, System.currentTimeMillis());
+    }
+
+    /**
+     * 带参考时刻的 NTP 时间戳换算（可单测、确定性）。
+     * 若换算结果与参考值相差超过半个 era（约 68 年），判定为 2036 年后的 era 1 并加减一个 era。
+     */
+    public static double ntpTsToMs(byte[] buf, int off, long referenceEpochMs) {
         long sec = ((buf[off] & 0xFFL) << 24) | ((buf[off + 1] & 0xFFL) << 16)
                 | ((buf[off + 2] & 0xFFL) << 8) | (buf[off + 3] & 0xFFL);
         long frac = ((buf[off + 4] & 0xFFL) << 24) | ((buf[off + 5] & 0xFFL) << 16)
                 | ((buf[off + 6] & 0xFFL) << 8) | (buf[off + 7] & 0xFFL);
-        return (sec - 2208988800L) * 1000.0 + frac / 4294967296.0 * 1000.0;
+        double ms = (sec - 2208988800L) * 1000.0 + frac / 4294967296.0 * 1000.0;
+        double diff = ms - referenceEpochMs;
+        if (diff < -NTP_HALF_ERA_MS) ms += 2.0 * NTP_HALF_ERA_MS;
+        else if (diff > NTP_HALF_ERA_MS) ms -= 2.0 * NTP_HALF_ERA_MS;
+        return ms;
     }
 
     /** NTP 32 位定点秒（16.16）→ 毫秒，用于 rootDelay / rootDispersion */
@@ -188,23 +203,51 @@ public final class TimeMath {
      * from MainActivity.fmt —— 抽到此处以便 JVM 单测覆盖时区/跨日/毫秒进位。
      */
     public static String formatClock(long ms, boolean withTenths, int tzOffsetSeconds) {
+        char[] b = new char[withTenths ? 10 : 8];
+        writeClock(b, 0, ms, withTenths, tzOffsetSeconds);
+        return new String(b);
+    }
+
+    /**
+     * 把时间写入调用方提供的字符缓冲（零分配，供 ClockView.onDraw 每秒复用）。
+     * 与 formatClock 共用同一实现，消除此前 ClockView 自带一份格式化导致的 DST/进位分歧。
+     *
+     * @param b        目标缓冲，长度至少 8（withTenths 时至少 10）
+     * @param off      写入起始下标
+     */
+    public static void writeClock(char[] b, int off, long ms, boolean withTenths,
+                                  int tzOffsetSeconds) {
         long sec = Math.floorDiv(ms, 1000L);
         int milli = (int) (ms - sec * 1000L);
         int sod = (int) Math.floorMod(sec + tzOffsetSeconds, 86400L);
         int hh = sod / 3600, mm = (sod % 3600) / 60, ss = sod % 60;
-        char[] b = new char[withTenths ? 10 : 8];
-        b[0] = (char) ('0' + hh / 10);
-        b[1] = (char) ('0' + hh % 10);
-        b[2] = ':';
-        b[3] = (char) ('0' + mm / 10);
-        b[4] = (char) ('0' + mm % 10);
-        b[5] = ':';
-        b[6] = (char) ('0' + ss / 10);
-        b[7] = (char) ('0' + ss % 10);
+        b[off] = (char) ('0' + hh / 10);
+        b[off + 1] = (char) ('0' + hh % 10);
+        b[off + 2] = ':';
+        b[off + 3] = (char) ('0' + mm / 10);
+        b[off + 4] = (char) ('0' + mm % 10);
+        b[off + 5] = ':';
+        b[off + 6] = (char) ('0' + ss / 10);
+        b[off + 7] = (char) ('0' + ss % 10);
         if (withTenths) {
-            b[8] = '.';
-            b[9] = (char) ('0' + milli / 100);
+            b[off + 8] = '.';
+            b[off + 9] = (char) ('0' + milli / 100);
         }
-        return new String(b);
+    }
+
+    /**
+     * 是否至少有一个"非可选"源成功。
+     * 用于区分「网络校时成功」与「仅靠系统缓存时间(sysnet/gnss)可用」：
+     * 断网时可选源仍可能 ok=true，此时 networkOk=false，UI 应提示校时失败而非"已同步"。
+     *
+     * @param ok       每个源是否成功
+     * @param optional 每个源是否为可选系统源
+     */
+    public static boolean hasNetworkSuccess(boolean[] ok, boolean[] optional) {
+        int n = Math.min(ok.length, optional.length);
+        for (int i = 0; i < n; i++) {
+            if (ok[i] && !optional[i]) return true;
+        }
+        return false;
     }
 }

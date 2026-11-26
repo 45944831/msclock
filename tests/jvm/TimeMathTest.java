@@ -67,6 +67,32 @@ public class TimeMathTest {
         // 定点数 1.5 秒 = 0x00018000
         byte[] fx = {(byte) 0x00, (byte) 0x01, (byte) 0x80, (byte) 0x00};
         near("NTP 32位定点秒", TimeMath.ntpFixedToMs(fx, 0), 1500.0, 1e-9);
+        // 2036-02-07 NTP 秒数翻绕到 era 1：字段从头计（3000 秒），
+        // 裸换算会得到 1970 附近；参考时刻在 2036 后应加回一个 era（2^32 秒）
+        long era1Sec = 3000L;   // era 1 中 2036-02-07 之后 3000 秒
+        byte[] e1 = new byte[8];
+        e1[0] = (byte) (era1Sec >> 24); e1[1] = (byte) (era1Sec >> 16);
+        e1[2] = (byte) (era1Sec >> 8); e1[3] = (byte) era1Sec;
+        long ref2036 = 2085981496000L;   // 2036-02-07 06:28:16 + 3000s 的 Unix 毫秒
+        near("NTP era1 纠偏", TimeMath.ntpTsToMs(e1, 0, ref2036),
+                2085981496000.0, 1.0);
+        // 正常 era 0 不应被误纠偏
+        near("NTP era0 不误纠", TimeMath.ntpTsToMs(ts, 0, 1577836800000L),
+                1577836800500.0, 1e-3);
+
+        System.out.println("[TimeMath] networkOk 判定（断网时系统缓存源不算校时成功）");
+        // 断网：14 网络源失败 + 仅 sysnet(可选)成功 → 不是网络校时成功
+        check("仅可选源成功不算", !TimeMath.hasNetworkSuccess(
+                new boolean[]{false, false, true}, new boolean[]{false, false, true}));
+        // 有任一非可选源成功 → 网络校时成功
+        check("有网络源成功算", TimeMath.hasNetworkSuccess(
+                new boolean[]{false, true, true}, new boolean[]{false, false, true}));
+        // 全失败
+        check("全失败不算", !TimeMath.hasNetworkSuccess(
+                new boolean[]{false, false}, new boolean[]{false, true}));
+        // 全网络源成功（无可选）
+        check("全网络成功算", TimeMath.hasNetworkSuccess(
+                new boolean[]{true, true}, new boolean[]{false, false}));
 
         System.out.println("[TimeMath] 时间格式化");
         // UTC 01:02:03.400 → 1970-01-01T01:02:03.400Z
@@ -124,6 +150,30 @@ public class TimeMathTest {
         double[] dW = TimeMath.fitDrift(new double[]{0, 60, 120},
                 new double[]{0, 50.0, 3.0}, new double[]{5, 500, 5}, 3);
         check("drift:离群点被降权", Math.abs(dW[0] - 25.0) < 3.0);
+
+        System.out.println("[Sources] 单一数据源一致性");
+        check("六数组结构一致", com.wb.msclock.Sources.consistent());
+        check("device 占 0 位", "device".equals(com.wb.msclock.Sources.KEYS[0]));
+        check("17 个源", com.wb.msclock.Sources.ALL.length == 17);
+        check("GNSS 可选", com.wb.msclock.Sources.ALL[15].optional());
+        check("NTP 非可选", !com.wb.msclock.Sources.ALL[14].optional());
+
+        System.out.println("[TimeBase] 统一走时基准");
+        com.wb.msclock.TimeBase tb = new com.wb.msclock.TimeBase();
+        check("未锚定回退墙钟", tb.at(1000L, 5000L) == 5000.0);
+        tb.anchor(10000.0, 1000L, 0);
+        near("锚点即时取值", tb.at(1000L, 0L), 10000.0, 1e-9);
+        near("单调推进1s无频偏", tb.at(2000L, 999999L), 11000.0, 1e-9);
+        tb.setDriftPpm(50);   // 50ppm：每 1000ms 快 0.05ms
+        near("频偏补偿1s", tb.at(2000L, 0L), 10000.0 + 1000.0 * (1 + 50e-6), 1e-6);
+        near("频偏补偿60s", tb.at(61000L, 0L), 10000.0 + 60000.0 * (1 + 50e-6), 1e-6);
+        near("atWithDrift用旧斜率", tb.atWithDrift(2000L, 0), 11000.0, 1e-9);
+        // 频偏突变时用旧斜率重锚，保证显示连续
+        double cont = tb.atWithDrift(61000L, 0);
+        tb.anchor(cont, 61000L, 100);
+        near("重锚后连续", tb.at(61000L, 0L), cont, 1e-6);
+        tb.reset();
+        check("reset 后未锚定", !tb.isAnchored() && tb.at(1L, 42L) == 42.0);
 
         System.out.println();
         System.out.println("RESULT: " + passed + " passed, " + failed + " failed");
